@@ -1,0 +1,2028 @@
+"""
+gerar_relatorio.py
+==================
+
+Gera relatorios em Excel (.xlsx) e PDF para cada ciclo detectado
+na pasta de dados da camara de resfriados.
+
+Para cada ciclo valido e produzido um par de arquivos:
+
+    relatorio_ciclo_<id>_<inicio>.xlsx
+    relatorio_ciclo_<id>_<inicio>.pdf
+
+Uso basico:
+
+    python gerar_relatorio.py <pasta_com_csv>
+
+Uso completo:
+
+    python gerar_relatorio.py <pasta_com_csv> \
+        --output-dir <pasta_saida> \
+        --rate-window 60 \
+        --tolerance 0.5 \
+        --cycle 3
+
+Dependencias: pandas, matplotlib, openpyxl, reportlab, streamlit.
+
+Observacao: este script importa as funcoes analiticas do seu aplicativo
+Streamlit assumindo que ele esta num arquivo chamado "app.py" na mesma
+pasta. Se o nome for diferente, ajuste o import abaixo.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import unicodedata
+from html import escape
+from io import BytesIO
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")  # backend sem GUI, necessario em execucao headless
+
+import matplotlib.pyplot as plt
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    Image as RLImage,
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+
+BASE_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = BASE_DIR / "assets"
+THOMS_LOGO_PATH = ASSETS_DIR / "thoms.jpg"
+PLOTTER_LOGO_PATH = ASSETS_DIR / "plotter_racks.png"
+
+# ---------------------------------------------------------------
+# Import das funcoes analiticas do Streamlit
+# ---------------------------------------------------------------
+# Se o arquivo do Streamlit NAO se chama app.py, troque a linha abaixo.
+from app import (  # noqa: E402
+    PHASE_DISPLAY,
+    CycleSummary,
+    add_derived_columns,
+    assign_cycle_ids,
+    build_cycle_summaries,
+    build_overall_metrics_table,
+    build_phase_summary_table,
+    format_float,
+    format_hours,
+    format_temp,
+    generate_cycle_description,
+    load_single_file,
+    parse_timestamp_series,
+    plot_cooling_rate,
+    plot_dt_series,
+    plot_glycol_error,
+    plot_dt_humidity_correlation,
+    plot_hourly_averages,
+    plot_operational_overview,
+    plot_temperature_overview,
+    select_cycle_df,
+)
+
+
+# ============================================================
+# LEITURA DA PASTA (versao sem cache do Streamlit)
+# ============================================================
+
+def load_consolidated_csv(file_path: Path) -> pd.DataFrame:
+    """
+    Le um CSV consolidado gerado por gerar_relatorio_camcarcacas.py
+    (com 5 linhas de cabeçalho, linha 6 é o header, dados a partir da linha 7).
+    """
+    # Lê o CSV pulando as 5 primeiras linhas, usando linha 6 como cabeçalho
+    df = pd.read_csv(
+        file_path,
+        sep=";",
+        skiprows=5,
+        decimal=",",
+    )
+
+    # A primeira coluna contém o timestamp (tem nome " " ou vazio)
+    # Renomeia primeiro antes de remover colunas vazias
+    first_col = df.columns[0]
+    df = df.rename(columns={first_col: "timestamp"})
+
+    # Limpa os nomes das demais colunas (remove espaços extras)
+    df.columns = [c.strip() if c != "timestamp" else c for c in df.columns]
+
+    # Remove colunas completamente vazias (NaN) - preservando as com dados
+    df = df.dropna(axis=1, how="all")
+
+    # Remove colunas que são apenas strings vazias ou espaços (exceto timestamp)
+    cols_to_keep = ["timestamp"]
+    for col in df.columns:
+        if col == "timestamp":
+            continue
+        if col == "" or col.isspace():
+            continue
+        cols_to_keep.append(col)
+    df = df[cols_to_keep]
+
+    # Mapeamento das colunas para o formato esperado
+    column_mapping = {
+        "Carregamento": "carregamento",
+        "Resfriamento": "resfriamento",
+        "Saida Y1 - Ventiladores EC": "ventiladores_ec",
+        "Temp entrada glicol": "temp_entrada_glicol",
+        "Temp ref": "temp_ref",
+        "Temp retorno ar": "temp_retorno_ar",
+        "Temperatuda espeto": "temperatura_espeto",  # Typo no CSV original
+        "Temperatura espeto": "temperatura_espeto",
+        "Umidade relativa da camara": "umidade_relativa_camara",
+    }
+
+    # Renomeia as colunas encontradas
+    df = df.rename(columns=column_mapping, errors="ignore")
+
+    # Converte timestamp para datetime
+    # dayfirst=True: garante que DD/MM/YYYY seja interpretado corretamente (padrão BR)
+    df["timestamp"] = parse_timestamp_series(df["timestamp"])
+    # Remove linhas com timestamp inválido
+    df = df.dropna(subset=["timestamp"])
+
+    # Remove colunas desnecessárias
+    cols_to_drop = ["Ciclo"] + [col for col in df.columns if col.startswith("Unnamed")]
+    df = df.drop(columns=cols_to_drop, errors="ignore")
+
+    # Garante a ordem das colunas esperadas
+    required_cols = [
+        "timestamp",
+        "carregamento",
+        "resfriamento",
+        "ventiladores_ec",
+        "temp_entrada_glicol",
+        "temp_ref",
+        "temp_retorno_ar",
+        "temperatura_espeto",
+        "umidade_relativa_camara",
+    ]
+
+    # Seleciona apenas as colunas que existem
+    existing_cols = [col for col in required_cols if col in df.columns]
+    df = df[existing_cols]
+
+    # Converte colunas numéricas (decimal com vírgula)
+    numeric_cols = [
+        "ventiladores_ec",
+        "temp_entrada_glicol",
+        "temp_ref",
+        "temp_retorno_ar",
+        "temperatura_espeto",
+        "umidade_relativa_camara",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.replace(",", ".", regex=False)
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Converte colunas ON/OFF para booleano
+    from app import parse_on_off
+    for col in ["carregamento", "resfriamento"]:
+        if col in df.columns:
+            df[col] = df[col].apply(parse_on_off)
+
+    return df
+
+
+def load_folder_no_cache(folder_path: str) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Carrega o banco único `data/historico.csv` se existir.
+    Caso contrário, faz fallback lendo todas as subpastas (modo legado).
+    """
+    folder = Path(folder_path)
+
+    if not folder.exists():
+        raise FileNotFoundError(f"Pasta nao encontrada: {folder}")
+    if not folder.is_dir():
+        raise NotADirectoryError(f"O caminho informado nao e uma pasta: {folder}")
+
+    # ── Modo novo: banco único acumulativo ──────────────────────────────
+    master = folder / "historico.csv"
+    if master.exists():
+        df = load_consolidated_csv(master)
+        df = (
+            df.sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"], keep="last")
+            .reset_index(drop=True)
+        )
+        return df, [master.name]
+
+    # ── Modo legado: varre subpastas `Ciclo N` ──────────────────────────
+    files = sorted(
+        list(folder.glob("*.csv")) +
+        list(folder.glob("**/*.csv"))
+    )
+    seen = set()
+    files = [f for f in files if not (f in seen or seen.add(f))]
+
+    # Ignora pastas de legado (já migradas)
+    files = [f for f in files if "_legado_pastas_ciclos" not in f.parts]
+
+    if not files:
+        raise FileNotFoundError(
+            "Nenhum banco de dados encontrado. "
+            "Execute 'Buscar dados do supervisório' ou 'Migrar pastas legadas' primeiro."
+        )
+
+    file_names = [f.name for f in files]
+
+    dfs = []
+    for f in files:
+        try:
+            df = load_consolidated_csv(f)
+            dfs.append(df)
+        except Exception as e:
+            print(f"Aviso: erro ao ler {f.name}: {e}", file=sys.stderr)
+            continue
+
+    if not dfs:
+        raise ValueError("Nenhum CSV válido foi carregado.")
+
+    df = pd.concat(dfs, ignore_index=True)
+    df = (
+        df.sort_values("timestamp")
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .reset_index(drop=True)
+    )
+
+    return df, file_names
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def slug_timestamp(ts: pd.Timestamp) -> str:
+    return ts.strftime("%Y%m%d_%H%M")
+
+
+# Dias da semana em português abreviados (0=segunda, 6=domingo)
+WEEKDAY_ABBR_PT = ["seg", "ter", "qua", "qui", "sex", "sab", "dom"]
+
+
+def format_cycle_filename(inicio: pd.Timestamp, fim: pd.Timestamp) -> str:
+    """
+    Gera nome de arquivo no formato:
+    Inicio_DD_MM_YY_Fim_DD_MM_YY_dia_dia
+
+    Exemplo: Inicio_21_04_26_Fim_22_04_26_seg_ter
+    """
+    inicio_str = inicio.strftime("%d_%m_%y")
+    fim_str = fim.strftime("%d_%m_%y")
+    dia_inicio = WEEKDAY_ABBR_PT[inicio.weekday()]
+    dia_fim = WEEKDAY_ABBR_PT[fim.weekday()]
+
+    if inicio.date() == fim.date():
+        return f"Inicio_{inicio_str}_Fim_{fim_str}_{dia_inicio}"
+    return f"Inicio_{inicio_str}_Fim_{fim_str}_{dia_inicio}_{dia_fim}"
+
+
+def save_fig_to_png_bytes(fig: plt.Figure, dpi: int = 140) -> BytesIO:
+    """Serializa uma figura do matplotlib para PNG em memoria."""
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+
+def format_pdf_value(value) -> str:
+    """Formata valores para exibicao no PDF em pt-BR (vigula decimal)."""
+    if value is None:
+        return "—"
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return "—"
+        return value.strftime("%d/%m/%Y %H:%M")
+    try:
+        if pd.isna(value):
+            return "—"
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, bool):
+        return "Sim" if value else "Nao"
+    if isinstance(value, float):
+        formatted = f"{value:,.2f}"
+        return formatted.replace(",", "X").replace(".", ",").replace("X", ".")
+    return str(value)
+
+
+# ============================================================
+# EXCEL
+# ============================================================
+
+FONT_NAME = "Arial"
+
+HEADER_FILL = PatternFill("solid", start_color="1F4E78")
+HEADER_FONT = Font(name=FONT_NAME, bold=True, color="FFFFFF", size=11)
+TITLE_FONT = Font(name=FONT_NAME, bold=True, size=16, color="1F4E78")
+SUBTITLE_FONT = Font(name=FONT_NAME, italic=True, size=11, color="404040")
+SECTION_FILL = PatternFill("solid", start_color="DCE6F1")
+SECTION_FONT = Font(name=FONT_NAME, bold=True, size=12, color="1F4E78")
+BOLD_FONT = Font(name=FONT_NAME, bold=True, size=10)
+NORMAL_FONT = Font(name=FONT_NAME, size=10)
+
+THIN_BORDER = Border(
+    left=Side(style="thin", color="B0B0B0"),
+    right=Side(style="thin", color="B0B0B0"),
+    top=Side(style="thin", color="B0B0B0"),
+    bottom=Side(style="thin", color="B0B0B0"),
+)
+
+
+def apply_header_row(ws, row: int, ncols: int) -> None:
+    """Aplica estilo de cabecalho azul em uma linha."""
+    for col in range(1, ncols + 1):
+        cell = ws.cell(row=row, column=col)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = THIN_BORDER
+
+
+def autosize_columns(ws, max_width: int = 40) -> None:
+    """Auto-ajusta largura das colunas com base no conteudo."""
+    for col_idx, column in enumerate(ws.columns, 1):
+        letter = get_column_letter(col_idx)
+        max_length = 0
+        for cell in column:
+            try:
+                value = "" if cell.value is None else str(cell.value)
+                if len(value) > max_length:
+                    max_length = len(value)
+            except Exception:
+                pass
+        ws.column_dimensions[letter].width = min(max(max_length + 2, 14), max_width)
+
+
+def write_cell_value(cell, value) -> None:
+    """Escreve um valor na celula aplicando formatacao numerica apropriada."""
+    if value is None:
+        cell.value = None
+    elif isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            cell.value = None
+        else:
+            cell.value = value.to_pydatetime()
+            cell.number_format = "DD/MM/YYYY HH:MM"
+    else:
+        try:
+            if pd.isna(value):
+                cell.value = None
+                cell.font = NORMAL_FONT
+                cell.border = THIN_BORDER
+                return
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, bool):
+            cell.value = "Sim" if value else "Nao"
+        elif isinstance(value, float):
+            cell.value = value
+            cell.number_format = "#,##0.00;(#,##0.00);-"
+        elif isinstance(value, int):
+            cell.value = value
+            cell.number_format = "#,##0"
+        else:
+            cell.value = value
+    cell.font = NORMAL_FONT
+    cell.border = THIN_BORDER
+
+
+def write_dataframe(ws, df: pd.DataFrame, start_row: int = 1) -> int:
+    """Escreve um DataFrame no worksheet a partir da linha start_row."""
+    if df.empty:
+        ws.cell(row=start_row, column=1, value="Sem dados").font = NORMAL_FONT
+        return start_row
+
+    # Cabecalho
+    for col_idx, col_name in enumerate(df.columns, 1):
+        ws.cell(row=start_row, column=col_idx, value=col_name)
+    apply_header_row(ws, start_row, len(df.columns))
+
+    # Dados
+    for row_idx, record in enumerate(df.itertuples(index=False), start=start_row + 1):
+        for col_idx, value in enumerate(record, 1):
+            write_cell_value(ws.cell(row=row_idx, column=col_idx), value)
+
+    return start_row + len(df)
+
+
+def write_key_value_block(ws, rows: list[tuple[str, object]], start_row: int) -> int:
+    """Escreve pares (rotulo, valor) em duas colunas."""
+    for label, value in rows:
+        label_cell = ws.cell(row=start_row, column=1, value=label)
+        label_cell.font = BOLD_FONT
+        label_cell.border = THIN_BORDER
+        label_cell.alignment = Alignment(vertical="center")
+
+        write_cell_value(ws.cell(row=start_row, column=2), value)
+        start_row += 1
+    return start_row
+
+
+def generate_excel_for_cycle(
+    output_path: Path,
+    cycle_df: pd.DataFrame,
+    summary: CycleSummary,
+    tolerance_band: float,
+    rate_window_minutes: int,
+) -> None:
+    """
+    Gera um arquivo .xlsx com 4 abas para o ciclo:
+      - Resumo              : informacoes e KPIs de cabecalho
+      - Indicadores Gerais  : tabela indicador x valor
+      - Resumo por Fase     : metricas por fase do ciclo
+      - Dados Calculados    : serie temporal com colunas derivadas
+    """
+    overall_df = build_overall_metrics_table(cycle_df, tolerance_band, rate_window_minutes)
+    phase_df = build_phase_summary_table(cycle_df, tolerance_band, rate_window_minutes)
+
+    wb = Workbook()
+
+    # ---------------- Aba 1: Resumo ----------------
+    ws = wb.active
+    ws.title = "Resumo"
+
+    ws.merge_cells("A1:B1")
+    t = ws.cell(row=1, column=1, value=f"Relatorio do Ciclo {summary.cycle_id}")
+    t.font = TITLE_FONT
+    t.alignment = Alignment(horizontal="center")
+
+    ws.merge_cells("A2:B2")
+    s = ws.cell(row=2, column=1, value="Camara de Resfriados - Analise de Ciclo")
+    s.font = SUBTITLE_FONT
+    s.alignment = Alignment(horizontal="center")
+
+    current_row = 4
+    section_cell = ws.cell(row=current_row, column=1, value="Informacoes do ciclo")
+    section_cell.font = SECTION_FONT
+    section_cell.fill = SECTION_FILL
+    section_cell.border = THIN_BORDER
+    b = ws.cell(row=current_row, column=2, value="")
+    b.fill = SECTION_FILL
+    b.border = THIN_BORDER
+    current_row += 1
+
+    info_rows: list[tuple[str, object]] = [
+        ("Ciclo", f"C{summary.cycle_id}"),
+        ("Inicio do ciclo", summary.inicio_ciclo),
+        ("Fim do ciclo", summary.fim_ciclo),
+        ("Inicio do carregamento", summary.inicio_carregamento),
+        ("Fim do carregamento", summary.fim_carregamento),
+        ("Inicio do resfriamento", summary.inicio_resfriamento),
+    ]
+    current_row = write_key_value_block(ws, info_rows, current_row)
+    current_row += 1
+
+    section_cell = ws.cell(row=current_row, column=1, value="Indicadores-chave")
+    section_cell.font = SECTION_FONT
+    section_cell.fill = SECTION_FILL
+    section_cell.border = THIN_BORDER
+    b = ws.cell(row=current_row, column=2, value="")
+    b.fill = SECTION_FILL
+    b.border = THIN_BORDER
+    current_row += 1
+
+    kpi_rows: list[tuple[str, object]] = [
+        ("Duracao total (h)", summary.duracao_total_h),
+        ("Duracao carregamento (h)", summary.duracao_carregamento_h),
+        ("Duracao resfriamento (h)", summary.duracao_resfriamento_h),
+        ("Espeto inicial (C)", summary.espeto_inicial),
+        ("Espeto final (C)", summary.espeto_final),
+        ("Tempo ate espeto <= 7 C (h)", summary.tempo_ate_7h),
+    ]
+    current_row = write_key_value_block(ws, kpi_rows, current_row)
+    current_row += 1
+
+    section_cell = ws.cell(row=current_row, column=1, value="Parametros do relatorio")
+    section_cell.font = SECTION_FONT
+    section_cell.fill = SECTION_FILL
+    section_cell.border = THIN_BORDER
+    b = ws.cell(row=current_row, column=2, value="")
+    b.fill = SECTION_FILL
+    b.border = THIN_BORDER
+    current_row += 1
+
+    param_rows: list[tuple[str, object]] = [
+        ("Faixa de tolerancia do glicol (C)", tolerance_band),
+        ("Janela da taxa de resfriamento (min)", rate_window_minutes),
+    ]
+    write_key_value_block(ws, param_rows, current_row)
+
+    autosize_columns(ws, max_width=45)
+
+    # ---------------- Aba 2: Indicadores Gerais ----------------
+    ws_ind = wb.create_sheet("Indicadores Gerais")
+    title = ws_ind.cell(row=1, column=1, value="Indicadores gerais do ciclo")
+    title.font = TITLE_FONT
+    ws_ind.merge_cells("A1:B1")
+
+    ws_ind.cell(row=3, column=1, value="Indicador")
+    ws_ind.cell(row=3, column=2, value="Valor")
+    apply_header_row(ws_ind, 3, 2)
+
+    if overall_df.empty:
+        ws_ind.cell(row=4, column=1, value="Sem dados").font = NORMAL_FONT
+    else:
+        row = 4
+        for col in overall_df.columns:
+            label_cell = ws_ind.cell(row=row, column=1, value=col)
+            label_cell.font = BOLD_FONT
+            label_cell.border = THIN_BORDER
+            write_cell_value(ws_ind.cell(row=row, column=2), overall_df[col].iloc[0])
+            row += 1
+
+    autosize_columns(ws_ind, max_width=50)
+
+    # ---------------- Aba 3: Resumo por Fase ----------------
+    ws_phase = wb.create_sheet("Resumo por Fase")
+    title = ws_phase.cell(row=1, column=1, value="Indicadores por fase do ciclo")
+    title.font = TITLE_FONT
+
+    phase_display_df = phase_df.copy()
+    if not phase_display_df.empty:
+        phase_display_df["Fase"] = (
+            phase_display_df["Fase"].map(PHASE_DISPLAY).fillna(phase_display_df["Fase"])
+        )
+    write_dataframe(ws_phase, phase_display_df, start_row=3)
+    autosize_columns(ws_phase, max_width=28)
+
+    # ---------------- Aba 4: Dados Calculados ----------------
+    ws_raw = wb.create_sheet("Dados Calculados")
+    title = ws_raw.cell(row=1, column=1, value="Dados calculados do ciclo")
+    title.font = TITLE_FONT
+
+    rate_esp_col = f"taxa_espeto_{rate_window_minutes}m"
+    rate_ret_col = f"taxa_retorno_ar_{rate_window_minutes}m"
+
+    wanted_cols = [
+        "timestamp",
+        "fase",
+        "carregamento",
+        "resfriamento",
+        "ventiladores_ec",
+        "temp_entrada_glicol",
+        "temp_ref",
+        "temp_retorno_ar",
+        "temperatura_espeto",
+        "umidade_relativa_camara",
+        "dt_sistema",
+        "erro_glicol",
+        "erro_glicol_abs",
+        rate_esp_col,
+        rate_ret_col,
+    ]
+    existing_cols = [c for c in wanted_cols if c in cycle_df.columns]
+    raw_df = cycle_df[existing_cols].copy()
+    if "fase" in raw_df.columns:
+        raw_df["fase"] = raw_df["fase"].map(PHASE_DISPLAY).fillna(raw_df["fase"])
+
+    write_dataframe(ws_raw, raw_df, start_row=3)
+    autosize_columns(ws_raw, max_width=24)
+    ws_raw.freeze_panes = "A4"
+
+    # ---------------- Aba 5: Gráficos ----------------
+    ws_charts = wb.create_sheet("Gráficos")
+    title = ws_charts.cell(row=1, column=1, value="Gráficos do ciclo")
+    title.font = TITLE_FONT
+    ws_charts.row_dimensions[1].height = 25
+
+    chart_configs = [
+        ("Comportamento térmico", lambda: plot_temperature_overview(cycle_df, summary)),
+        ("Ventiladores e umidade", lambda: plot_operational_overview(cycle_df, summary)),
+        ("DT do sistema", lambda: plot_dt_series(cycle_df, summary)),
+        ("Aderência do glicol", lambda: plot_glycol_error(cycle_df, summary, tolerance_band)),
+        (f"Taxa de queda - Espeto ({rate_window_minutes}m)", lambda: plot_cooling_rate(cycle_df, summary, rate_window_minutes, "espeto")),
+        (f"Taxa de queda - Retorno ar ({rate_window_minutes}m)", lambda: plot_cooling_rate(cycle_df, summary, rate_window_minutes, "retorno_ar")),
+    ]
+
+    current_row = 3
+    for chart_title, plot_fn in chart_configs:
+        try:
+            fig = plot_fn()
+            # Salva figura em PNG na memória
+            img_buf = save_fig_to_png_bytes(fig, dpi=100)
+
+            # Escreve o rótulo do gráfico
+            label_cell = ws_charts.cell(row=current_row, column=1, value=chart_title)
+            label_cell.font = BOLD_FONT
+
+            # Insere imagem no Excel (7cm de largura ≈ 26 caracteres)
+            from openpyxl.drawing.image import Image as XLImage
+            from io import BytesIO
+
+            img_stream = BytesIO(img_buf.getvalue())
+            img_stream.seek(0)
+            img_xl = XLImage(img_stream)
+            img_xl.width = 520
+            img_xl.height = 300
+
+            ws_charts.add_image(img_xl, f"A{current_row + 1}")
+            current_row += 20  # Espaço para a imagem
+
+            plt.close(fig)
+        except Exception as exc:
+            label_cell = ws_charts.cell(row=current_row, column=1, value=f"{chart_title} - Erro ao gerar")
+            label_cell.font = BOLD_FONT
+            ws_charts.cell(row=current_row + 1, column=1, value=str(exc))
+            current_row += 3
+
+    wb.save(output_path)
+
+
+# ============================================================
+# PDF
+# ============================================================
+
+def build_styles() -> dict:
+    base = getSampleStyleSheet()
+    return {
+        "title": ParagraphStyle(
+            name="CustomTitle",
+            parent=base["Title"],
+            fontSize=20,
+            textColor=colors.HexColor("#1F4E78"),
+            spaceAfter=6,
+        ),
+        "cover_title": ParagraphStyle(
+            name="CoverTitle",
+            parent=base["Title"],
+            fontSize=26,
+            textColor=colors.white,
+            alignment=1,
+            spaceAfter=0,
+            spaceBefore=0,
+            fontName="Helvetica-Bold",
+        ),
+        "cover_subtitle": ParagraphStyle(
+            name="CoverSubtitle",
+            parent=base["Normal"],
+            fontSize=13,
+            textColor=colors.HexColor("#404040"),
+            alignment=1,
+            spaceAfter=4,
+            spaceBefore=0,
+            fontName="Helvetica-Oblique",
+        ),
+        "cover_date": ParagraphStyle(
+            name="CoverDate",
+            parent=base["Normal"],
+            fontSize=10,
+            textColor=colors.HexColor("#707070"),
+            alignment=1,
+            spaceAfter=0,
+        ),
+        "kpi_value": ParagraphStyle(
+            name="KpiValue",
+            parent=base["Normal"],
+            fontSize=14,
+            textColor=colors.HexColor("#1F4E78"),
+            alignment=1,
+            fontName="Helvetica-Bold",
+            spaceAfter=0,
+            spaceBefore=0,
+        ),
+        "kpi_label": ParagraphStyle(
+            name="KpiLabel",
+            parent=base["Normal"],
+            fontSize=7,
+            textColor=colors.HexColor("#707070"),
+            alignment=1,
+            spaceAfter=0,
+            spaceBefore=0,
+        ),
+        "subtitle": ParagraphStyle(
+            name="CustomSubtitle",
+            parent=base["Normal"],
+            fontSize=11,
+            textColor=colors.HexColor("#404040"),
+            alignment=1,
+            spaceAfter=16,
+            italic=True,
+        ),
+        "section": ParagraphStyle(
+            name="Section",
+            parent=base["Heading2"],
+            fontSize=11.5,
+            textColor=colors.HexColor("#1F4E78"),
+            spaceBefore=4,
+            spaceAfter=4,
+        ),
+        "normal": ParagraphStyle(
+            name="Body",
+            parent=base["Normal"],
+            fontSize=8.8,
+            leading=10.8,
+        ),
+        "table_header": ParagraphStyle(
+            name="TableHeader",
+            parent=base["Normal"],
+            fontSize=7.5,
+            leading=9,
+            textColor=colors.white,
+            fontName="Helvetica-Bold",
+            alignment=1,
+        ),
+        "table_cell": ParagraphStyle(
+            name="TableCell",
+            parent=base["Normal"],
+            fontSize=7.5,
+            leading=9,
+            textColor=colors.HexColor("#202020"),
+        ),
+        "description": ParagraphStyle(
+            name="Description",
+            parent=base["Normal"],
+            fontSize=9,
+            leading=12,
+            textColor=colors.HexColor("#333333"),
+            spaceAfter=2,
+            spaceBefore=1,
+        ),
+        "alert": ParagraphStyle(
+            name="Alert",
+            parent=base["Normal"],
+            fontSize=10,
+            leading=16,
+            textColor=colors.HexColor("#856404"),
+            backColor=colors.HexColor("#FFF3CD"),
+            spaceAfter=4,
+            spaceBefore=2,
+            borderPad=4,
+        ),
+        "caption": ParagraphStyle(
+            name="Caption",
+            parent=base["Normal"],
+            fontSize=7.2,
+            textColor=colors.HexColor("#707070"),
+            alignment=1,
+            spaceAfter=3,
+        ),
+    }
+
+
+def kv_table(rows: list[list[str]], col_widths=(7 * cm, 9 * cm)) -> Table:
+    """Tabela de duas colunas: rotulo (azul claro) x valor (branco)."""
+    t = Table(rows, colWidths=col_widths)
+    t.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#DCE6F1")),
+        ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#1F4E78")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#B0B0B0")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+    ]))
+    return t
+
+
+def build_kpi_summary_table(kpis: list[tuple[str, str]], styles: dict, width_cm: float = 18.3) -> Table:
+    """Renderiza faixa horizontal de KPIs (estilo card) — valores na linha superior, rótulos na inferior."""
+    n = len(kpis)
+    col_w = width_cm * cm / n
+    values_row = [Paragraph(val, styles["kpi_value"]) for _, val in kpis]
+    labels_row = [Paragraph(lbl, styles["kpi_label"]) for lbl, _ in kpis]
+    t = Table([values_row, labels_row], colWidths=[col_w] * n)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EBF2FA")),
+        ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#DCE6F1")),
+        ("BOX", (0, 0), (-1, -1), 1, colors.HexColor("#1F4E78")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#B0C4DE")),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    return t
+
+
+def hrule(width_cm: float = 18.3) -> Table:
+    """Linha horizontal azul de separação entre seções."""
+    t = Table([[""]], colWidths=[width_cm * cm], rowHeights=[1])
+    t.setStyle(TableStyle([("LINEABOVE", (0, 0), (-1, -1), 1.5, colors.HexColor("#1F4E78"))]))
+    return t
+
+
+def data_table(header: list[str], rows: list[list[str]], col_widths=None) -> Table:
+    """Tabela de dados com cabecalho azul escuro e linhas zebradas."""
+    all_rows = [header] + rows
+    t = Table(all_rows, colWidths=col_widths, repeatRows=1)
+    t.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 7.5),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E78")),
+        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 1), (-1, -1), 7),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F6FA")]),
+        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#B0B0B0")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    return t
+
+
+def image_from_fig(fig: plt.Figure, width_cm: float = 17.0) -> RLImage:
+    """Converte figura do matplotlib em imagem para o Platypus preservando a proporcao."""
+    fig_w_in, fig_h_in = fig.get_size_inches()
+    aspect = fig_h_in / fig_w_in
+    buf = save_fig_to_png_bytes(fig, dpi=140)
+    img = RLImage(buf, width=width_cm * cm, height=width_cm * cm * aspect)
+    return img
+
+
+def logo_image(path: Path, width_cm: float, height_cm: float) -> RLImage | str:
+    """Cria imagem de logo quando o arquivo esta disponivel."""
+    if not path.exists():
+        return ""
+    return RLImage(str(path), width=width_cm * cm, height=height_cm * cm)
+
+
+def build_cover_brand_table() -> Table:
+    thoms_logo = logo_image(THOMS_LOGO_PATH, width_cm=4.6, height_cm=2.3)
+    plotter_logo = logo_image(PLOTTER_LOGO_PATH, width_cm=5.2, height_cm=0.9)
+    table = Table(
+        [[thoms_logo, plotter_logo]],
+        colWidths=[9.15 * cm, 9.15 * cm],
+        rowHeights=[2.8 * cm],
+    )
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, 0), colors.white),
+        ("BACKGROUND", (1, 0), (1, 0), colors.HexColor("#1F4E78")),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#D9E2EC")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D9E2EC")),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    return table
+
+
+def _normalize_label(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value).lower())
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return " ".join(text.replace("\n", " ").split())
+
+
+def _value_by_tokens(row: pd.Series, *tokens: str):
+    normalized_tokens = [_normalize_label(token) for token in tokens]
+    for col in row.index:
+        label = _normalize_label(col)
+        if all(token in label for token in normalized_tokens):
+            value = row[col]
+            try:
+                return None if pd.isna(value) else value
+            except (TypeError, ValueError):
+                return value
+    return None
+
+
+def _fmt_eng(value, suffix: str = "", decimals: int = 2) -> str:
+    if value is None:
+        return "-"
+    try:
+        if pd.isna(value):
+            return "-"
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%d/%m/%Y %H:%M")
+    if isinstance(value, float):
+        return f"{value:.{decimals}f}{suffix}".replace(".", ",")
+    return f"{value}{suffix}"
+
+
+def _status_text(ok: bool | None) -> str:
+    if ok is None:
+        return "Sem dados"
+    return "Conforme" if ok else "Verificar"
+
+
+def _status_fill(ok: bool | None):
+    if ok is None:
+        return colors.HexColor("#F2F2F2")
+    return colors.HexColor("#D9EAD3") if ok else colors.HexColor("#FCE4D6")
+
+
+def _pdf_cell(text: object, styles: dict, style_name: str = "normal") -> Paragraph:
+    value = "" if text is None else str(text)
+    value = value.replace("&", "&amp;").replace("<", "&lt;")
+    return Paragraph(value, styles[style_name])
+
+
+def engineering_table(header: list[str], rows: list[list[str]], col_widths=None) -> Table:
+    styles = build_styles()
+    paragraph_rows = [
+        [_pdf_cell(cell, styles, "table_header") for cell in header],
+        *[
+            [_pdf_cell(cell, styles, "table_cell") for cell in row]
+            for row in rows
+        ],
+    ]
+    table = Table(paragraph_rows, colWidths=col_widths, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 8),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E78")),
+        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 1), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#A6A6A6")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F7FAFC")]),
+    ]))
+    return table
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  INDICADORES CONSOLIDADOS DO CICLO
+#  Centraliza o cálculo dos flags de conformidade para evitar duplicação
+#  entre build_engineering_analysis() e build_conclusion_page().
+# ═════════════════════════════════════════════════════════════════════════════
+
+from dataclasses import dataclass
+
+
+@dataclass
+class CycleIndicators:
+    """Indicadores derivados (valores + flags de conformidade) de um ciclo."""
+    # Valores brutos
+    tempo_7: float | None
+    esp_inicial: float | None
+    esp_final: float | None
+    queda_espeto: float | None
+    retorno_inicial: float | None
+    retorno_final: float | None
+    queda_retorno: float | None
+    folga_ate_16h: float | None
+    atraso_acima_16h: float | None
+    erro_abs_glicol: float | None
+    pct_glicol: float | None
+    dt_medio_resf: float | None
+    umidade_media: float | None
+    ventilacao_media: float | None
+    dur_resf: float | None
+    # Flags de conformidade
+    meta_ok: bool
+    fim_ok: bool
+    glicol_ok: bool
+    umidade_ideal: bool
+    umidade_aceitavel: bool
+    atraso_ok: bool
+
+    @property
+    def verdict(self) -> str:
+        """Veredito executivo de uma linha."""
+        if not self.fim_ok or not self.meta_ok:
+            return "Processo requer avaliacao: meta termica do espeto nao atendida dentro do criterio."
+        if not self.umidade_ideal or not self.glicol_ok:
+            return "Processo termicamente aceitavel, com oportunidade de melhoria em umidade, DT ou controle do glicol."
+        return "Processo conforme para os criterios avaliados."
+
+    @property
+    def qualitative_summary(self) -> str:
+        """Leitura qualitativa do ciclo (2-3 linhas)."""
+        if self.meta_ok and self.umidade_ideal:
+            return (
+                "O ciclo atende ao objetivo principal de resfriamento e preserva uma condicao "
+                "de umidade alinhada ao alvo operacional."
+            )
+        if self.meta_ok and self.umidade_aceitavel:
+            return (
+                "O ciclo atende ao objetivo termico principal, mas a umidade ficou em faixa "
+                "aceitavel, abaixo do alvo ideal."
+            )
+        if self.meta_ok:
+            return (
+                "O ciclo atende ao objetivo termico principal, porem a umidade ficou abaixo "
+                "da faixa desejada para preservacao de massa e qualidade."
+            )
+        return (
+            "O ciclo nao atende plenamente ao objetivo termico principal; os ajustes de DT, "
+            "ventilacao e capacidade devem priorizar a chegada do espeto a 7 C em ate 16 h."
+        )
+
+
+def calculate_indicators(
+    summary: CycleSummary,
+    overall_df: pd.DataFrame,
+    tolerance_band: float,
+    max_cycle_hours: float = 16.0,
+) -> CycleIndicators | None:
+    """
+    Consolida os indicadores e flags de conformidade do ciclo.
+    Retorna None se não houver dados suficientes.
+    """
+    if overall_df is None or overall_df.empty:
+        return None
+
+    row = overall_df.iloc[0]
+
+    tempo_7 = summary.tempo_ate_7h
+    esp_final = summary.espeto_final
+    dur_resf = summary.duracao_resfriamento_h
+
+    esp_inicial       = _value_by_tokens(row, "espeto", "inicial")
+    queda_espeto      = _value_by_tokens(row, "queda", "espeto")
+    retorno_inicial   = _value_by_tokens(row, "retorno", "inicial")
+    retorno_final     = _value_by_tokens(row, "retorno", "final")
+    queda_retorno     = _value_by_tokens(row, "queda", "retorno")
+    folga_ate_16h     = _value_by_tokens(row, "folga", "16")
+    atraso_acima_16h  = _value_by_tokens(row, "atraso", "16")
+    erro_abs_glicol   = _value_by_tokens(row, "erro", "abs", "medio", "glicol")
+    pct_glicol        = _value_by_tokens(row, "dentro", f"{tolerance_band:.1f}")
+    dt_medio_resf     = _value_by_tokens(row, "dt", "medio", "resfriamento")
+    umidade_media     = _value_by_tokens(row, "umidade", "media")
+    ventilacao_media  = _value_by_tokens(row, "ventilacao", "media")
+
+    return CycleIndicators(
+        tempo_7=tempo_7,
+        esp_inicial=esp_inicial,
+        esp_final=esp_final,
+        queda_espeto=queda_espeto,
+        retorno_inicial=retorno_inicial,
+        retorno_final=retorno_final,
+        queda_retorno=queda_retorno,
+        folga_ate_16h=folga_ate_16h,
+        atraso_acima_16h=atraso_acima_16h,
+        erro_abs_glicol=erro_abs_glicol,
+        pct_glicol=pct_glicol,
+        dt_medio_resf=dt_medio_resf,
+        umidade_media=umidade_media,
+        ventilacao_media=ventilacao_media,
+        dur_resf=dur_resf,
+        meta_ok=tempo_7 is not None and tempo_7 <= max_cycle_hours,
+        fim_ok=esp_final is not None and esp_final <= 7,
+        glicol_ok=pct_glicol is not None and pct_glicol >= 70,
+        umidade_ideal=umidade_media is not None and umidade_media >= 95,
+        umidade_aceitavel=umidade_media is not None and 90 <= umidade_media < 95,
+        atraso_ok=atraso_acima_16h is not None and atraso_acima_16h == 0,
+    )
+
+
+def build_engineering_analysis(
+    summary: CycleSummary,
+    overall_df: pd.DataFrame,
+    phase_df: pd.DataFrame,
+    tolerance_band: float,
+    rate_window_minutes: int,
+    styles: dict,
+    max_cycle_hours: float = 16.0,
+) -> list:
+    """Monta a analise do PDF em formato de parecer tecnico."""
+    ind = calculate_indicators(summary, overall_df, tolerance_band, max_cycle_hours)
+    if ind is None:
+        return [Paragraph("Dados insuficientes para gerar a analise tecnica.", styles["normal"])]
+
+    umidade_aval = (
+        "Ideal" if ind.umidade_ideal
+        else ("Aceitavel" if ind.umidade_aceitavel else "Verificar")
+    )
+    umidade_flag = True if ind.umidade_ideal else (None if ind.umidade_aceitavel else False)
+
+    elements: list = []
+    elements.append(Paragraph("Parecer tecnico de engenharia", styles["section"]))
+    elements.append(hrule())
+    elements.append(Spacer(1, 0.08 * cm))
+
+    executive_rows = [
+        ["Ciclo", f"C{summary.cycle_id}"],
+        ["Periodo", f"{_fmt_eng(summary.inicio_ciclo)} a {_fmt_eng(summary.fim_ciclo)}"],
+        ["Resultado", ind.verdict],
+        ["Criterio principal", f"T_espeto <= 7 C em ate {max_cycle_hours:.0f} h de resfriamento"],
+        ["Tempo ate 7 C", _fmt_eng(ind.tempo_7, " h")],
+        ["Folga ate 16 h / atraso", f"{_fmt_eng(ind.folga_ate_16h, ' h')} / {_fmt_eng(ind.atraso_acima_16h, ' h')}"],
+        ["Trajetoria do espeto", f"{_fmt_eng(ind.esp_inicial, ' C', 1)} -> {_fmt_eng(ind.esp_final, ' C', 1)} | queda {_fmt_eng(ind.queda_espeto, ' C', 1)}"],
+        ["Temp. retorno inicial -> retorno ao atingir 7 C", f"{_fmt_eng(ind.retorno_inicial, ' C', 1)} -> {_fmt_eng(ind.retorno_final, ' C', 1)} | queda {_fmt_eng(ind.queda_retorno, ' C', 1)}"],
+    ]
+    elements.append(engineering_table(
+        ["Campo", "Valor"],
+        executive_rows,
+        col_widths=[4.3 * cm, 12.1 * cm],
+    ))
+    elements.append(Spacer(1, 0.14 * cm))
+
+    # Cada linha traz seu próprio flag de status (None = informativo, sem cor)
+    criteria_data = [
+        (["Meta do espeto",               _fmt_eng(ind.tempo_7, " h"),          f"T_espeto <= 7 C em ate {max_cycle_hours:.0f} h de resfriamento", _status_text(ind.meta_ok)], ind.meta_ok),
+        (["Folga ate 16 h",               _fmt_eng(ind.folga_ate_16h, " h"),    "Tempo disponivel para otimizar ciclo", "Informativo"],                                       None),
+        (["Atraso acima de 16 h",         _fmt_eng(ind.atraso_acima_16h, " h"), "Deve tender a zero",                    _status_text(ind.atraso_ok)],                         ind.atraso_ok),
+        (["Queda do espeto",              _fmt_eng(ind.queda_espeto, " C", 1),  "Carga termica removida do produto",     "Informativo"],                                       None),
+        (["Queda retorno ate 7 C",        _fmt_eng(ind.queda_retorno, " C", 1), "Resposta termica ate o espeto atingir 7 C", "Informativo"],                                    None),
+        (["Tempo total de resfriamento",  _fmt_eng(ind.dur_resf, " h"),         "Informativo; pode exceder 16 h",        "Informativo"],                                       None),
+        (["Temperatura final do espeto",  _fmt_eng(ind.esp_final, " C", 1),     "<= 7 C",                                _status_text(ind.fim_ok)],                            ind.fim_ok),
+        (["Controle do glicol",           _fmt_eng(ind.pct_glicol, " %", 1),    f">= 70 % dentro de +/- {tolerance_band:.1f} C", _status_text(ind.glicol_ok)],                  ind.glicol_ok),
+        (["Erro medio absoluto do glicol", _fmt_eng(ind.erro_abs_glicol, " C", 2), "Quanto menor, melhor",                "Informativo"],                                       None),
+        (["DT medio no resfriamento",     _fmt_eng(ind.dt_medio_resf, " C", 2), "Acompanhar tendencia por fase",         "Informativo"],                                       None),
+        (["Umidade media",                _fmt_eng(ind.umidade_media, " %", 1), "Ideal >= 95 %; aceitavel 90 % a 95 %",  umidade_aval],                                        umidade_flag),
+    ]
+    criteria_rows = [r for r, _ in criteria_data]
+    criteria_status = [s for _, s in criteria_data]
+
+    criteria_table = engineering_table(
+        ["Indicador", "Valor medido", "Criterio de engenharia", "Avaliacao"],
+        criteria_rows,
+        col_widths=[4.1 * cm, 3.0 * cm, 5.7 * cm, 3.6 * cm],
+    )
+    for idx, ok in enumerate(criteria_status, start=1):
+        criteria_table.setStyle(TableStyle([("BACKGROUND", (3, idx), (3, idx), _status_fill(ok))]))
+    elements.append(criteria_table)
+    elements.append(Spacer(1, 0.14 * cm))
+
+    elements.append(Paragraph("Leitura por fase", styles["section"]))
+    if not phase_df.empty:
+        phase_rows = []
+        for _, phase in phase_df.iterrows():
+            fase = PHASE_DISPLAY.get(str(phase.get("Fase")), str(phase.get("Fase")))
+            dur = _value_by_tokens(phase, "duracao")
+            esp_ini = _value_by_tokens(phase, "espeto", "inicial")
+            esp_fim = _value_by_tokens(phase, "espeto", "final")
+            queda_esp = _value_by_tokens(phase, "queda", "espeto")
+            ret_ini = _value_by_tokens(phase, "retorno", "inicial")
+            ret_fim = _value_by_tokens(phase, "retorno", "final")
+            queda_ret = _value_by_tokens(phase, "queda", "retorno")
+            dt_med = _value_by_tokens(phase, "dt", "medio")
+            umid = _value_by_tokens(phase, "umidade", "media")
+            vent = _value_by_tokens(phase, "ventilacao", "media")
+            pct_phase = _value_by_tokens(phase, "dentro", "faixa")
+            taxa_esp = _value_by_tokens(phase, "taxa", "espeto", f"{rate_window_minutes}")
+
+            comentario = "Estavel"
+            if umid is not None and umid >= 95:
+                comentario = "UR no alvo"
+            elif umid is not None and umid >= 90:
+                comentario = "UR aceitavel"
+            elif umid is not None:
+                comentario = "UR abaixo do alvo"
+            elif pct_phase is not None and pct_phase < 70:
+                comentario = "Ajustar controle do glicol"
+
+            phase_rows.append([
+                escape(fase),
+                _fmt_eng(dur, " h"),
+                f"{_fmt_eng(esp_ini, ' C', 1)} -> {_fmt_eng(esp_fim, ' C', 1)}",
+                _fmt_eng(queda_esp, " C", 1),
+                f"{_fmt_eng(ret_ini, ' C', 1)} -> {_fmt_eng(ret_fim, ' C', 1)}",
+                _fmt_eng(queda_ret, " C", 1),
+                _fmt_eng(dt_med, " C", 2),
+                _fmt_eng(umid, " %", 1),
+                escape(comentario),
+            ])
+
+        elements.append(engineering_table(
+            ["Fase", "Dur.", "Espeto ini -> fim", "Queda esp.", "Retorno ini -> fim", "Queda ret.", "DT med.", "UR med.", "Comentario"],
+            phase_rows,
+            col_widths=[2.9 * cm, 1.2 * cm, 2.4 * cm, 1.5 * cm, 2.4 * cm, 1.5 * cm, 1.4 * cm, 1.4 * cm, 2.0 * cm],
+        ))
+    else:
+        elements.append(Paragraph("Sem dados suficientes para consolidar a leitura por fase.", styles["normal"]))
+
+    return elements
+
+
+def build_conclusion_page(
+    summary: CycleSummary,
+    overall_df: pd.DataFrame,
+    phase_df: pd.DataFrame,
+    tolerance_band: float,
+    rate_window_minutes: int,
+    styles: dict,
+    max_cycle_hours: float = 16.0,
+) -> list:
+    """Cria uma pagina de conclusao com leitura qualitativa e quantitativa."""
+    indicators = calculate_indicators(summary, overall_df, tolerance_band, max_cycle_hours)
+    if indicators is None:
+        return [Paragraph("Conclusao indisponivel por falta de dados consolidados.", styles["normal"])]
+
+    tempo_7 = indicators.tempo_7
+    queda_espeto = indicators.queda_espeto
+    queda_retorno = indicators.queda_retorno
+    folga_ate_16h = indicators.folga_ate_16h
+    dt_resf = indicators.dt_medio_resf
+    umidade_media = indicators.umidade_media
+    ventilacao_media = indicators.ventilacao_media
+    erro_abs = indicators.erro_abs_glicol
+
+    meta_espeto_ok = indicators.meta_ok
+    umidade_ideal = indicators.umidade_ideal
+    umidade_aceitavel = indicators.umidade_aceitavel
+    qualitative = indicators.qualitative_summary
+
+    conclusion_rows = [
+        ["Objetivo", "Resultado quantitativo", "Leitura qualitativa"],
+        [
+            "Espeto <= 7 C em ate 16 h de resfriamento",
+            f"{_fmt_eng(tempo_7, ' h')} | folga {_fmt_eng(folga_ate_16h, ' h')}",
+            "Atendido" if meta_espeto_ok else "Nao atendido / verificar",
+        ],
+        [
+            "Queda termica do espeto",
+            _fmt_eng(queda_espeto, " C", 1),
+            "Mostra quanto calor foi retirado do produto no ciclo",
+        ],
+        [
+            "Queda termica do retorno de ar",
+            _fmt_eng(queda_retorno, " C", 1),
+            "Mostra como a camara respondeu ao resfriamento",
+        ],
+        [
+            "Umidade relativa ideal acima de 95 %",
+            _fmt_eng(umidade_media, " %", 1),
+            "Ideal" if umidade_ideal else ("Aceitavel" if umidade_aceitavel else "Abaixo do alvo"),
+        ],
+        [
+            "DT como alavanca de troca termica",
+            _fmt_eng(dt_resf, " C", 2),
+            "Usar tendencia do DT para balancear velocidade de resfriamento e perda de umidade",
+        ],
+        [
+            "Ventilacao limitada em periodos estrategicos",
+            _fmt_eng(ventilacao_media, " %", 1),
+            "Comparar por fase com UR e taxa de queda do espeto",
+        ],
+        [
+            "Estabilidade do glicol",
+            _fmt_eng(erro_abs, " C", 2),
+            f"Referencia: erro absoluto baixo e boa permanencia em +/- {tolerance_band:.1f} C",
+        ],
+    ]
+
+    elements: list = []
+    elements.append(Paragraph("Conclusao tecnica", styles["section"]))
+    elements.append(hrule())
+    elements.append(Spacer(1, 0.2 * cm))
+    elements.append(Paragraph(qualitative, styles["description"]))
+    elements.append(Spacer(1, 0.25 * cm))
+    elements.append(engineering_table(
+        conclusion_rows[0],
+        conclusion_rows[1:],
+        col_widths=[5.1 * cm, 3.6 * cm, 7.7 * cm],
+    ))
+
+    return elements
+
+
+def build_phase_story_page(
+    summary: CycleSummary,
+    phase_df: pd.DataFrame,
+    styles: dict,
+    rate_window_minutes: int,
+    max_cycle_hours: float = 16.0,
+) -> list:
+    """Conta a historia tecnica do ciclo por etapa operacional."""
+    elements: list = []
+    elements.append(Paragraph("Analise por etapa do ciclo", styles["section"]))
+    elements.append(hrule())
+    elements.append(Spacer(1, 0.18 * cm))
+
+    if phase_df.empty:
+        elements.append(Paragraph("Nao ha dados por fase suficientes para montar a narrativa do ciclo.", styles["normal"]))
+        return elements
+
+    phase_local = phase_df.copy()
+    phase_local["_ordem"] = phase_local["Fase"].map({phase: idx for idx, phase in enumerate(PHASE_DISPLAY.keys())})
+    phase_local = phase_local.sort_values("_ordem")
+
+    for _, phase in phase_local.iterrows():
+        phase_key = str(phase.get("Fase"))
+        phase_name = PHASE_DISPLAY.get(phase_key, phase_key)
+        dur = _value_by_tokens(phase, "duracao")
+        esp_ini = _value_by_tokens(phase, "espeto", "inicial")
+        esp_fim = _value_by_tokens(phase, "espeto", "final")
+        queda_esp = _value_by_tokens(phase, "queda", "espeto")
+        ret_ini = _value_by_tokens(phase, "retorno", "inicial")
+        ret_fim = _value_by_tokens(phase, "retorno", "final")
+        queda_ret = _value_by_tokens(phase, "queda", "retorno")
+        dt_med = _value_by_tokens(phase, "dt", "medio")
+        umid = _value_by_tokens(phase, "umidade", "media")
+        vent = _value_by_tokens(phase, "ventilacao", "media")
+        taxa_esp = _value_by_tokens(phase, "taxa", "espeto", f"{rate_window_minutes}")
+
+        if phase_key.startswith("1."):
+            role = (
+                "Esta etapa representa a entrada de carga termica. A prioridade de leitura aqui e entender "
+                "o ponto de partida do lote: temperatura do espeto, tempo de porta/processo e estabilidade "
+                "inicial da camara antes do resfriamento efetivo."
+            )
+        elif "retorno > 10" in _normalize_label(phase_key):
+            role = (
+                "Esta e a fase de maior carga sensivel. O retorno de ar ainda esta quente, portanto o DT "
+                "costuma ser a principal alavanca para retirar calor rapidamente sem derrubar a umidade "
+                "abaixo da faixa desejada."
+            )
+        elif "5 < retorno" in _normalize_label(phase_key):
+            role = (
+                "Aqui o processo entra em zona intermediaria: a carga termica ja caiu, mas o espeto ainda "
+                "precisa continuar evoluindo. A leitura importante e se a taxa de queda permanece consistente "
+                "sem exigir ventilacao excessiva."
+            )
+        elif "0 <=" in _normalize_label(phase_key):
+            role = (
+                "Nesta fase a camara trabalha mais perto da condicao final. O risco passa a ser gastar energia "
+                "e umidade para ganhos menores de temperatura; por isso DT, ventilacao e UR devem ser avaliados "
+                "em conjunto."
+            )
+        else:
+            role = (
+                "Depois que o espeto chega a 7 C, o foco muda: manter condicao segura sem prolongar agressividade "
+                "desnecessaria de DT ou ventilacao, preservando umidade e estabilidade do produto."
+            )
+
+        ur_text = "UR no alvo ideal" if umid is not None and umid >= 95 else (
+            "UR aceitavel, mas abaixo do ideal" if umid is not None and umid >= 90 else "UR abaixo do alvo operacional"
+        )
+        pace_text = "taxa de queda consistente" if taxa_esp is not None and taxa_esp > 0 else "queda termica baixa ou instavel"
+
+        elements.append(Paragraph(escape(phase_name), styles["section"]))
+        elements.append(Paragraph(role, styles["description"]))
+        elements.append(engineering_table(
+            ["Indicador da etapa", "Leitura"],
+            [
+                ["Duracao", _fmt_eng(dur, " h")],
+                ["Espeto inicial -> final", f"{_fmt_eng(esp_ini, ' C', 1)} -> {_fmt_eng(esp_fim, ' C', 1)}"],
+                ["Queda do espeto", _fmt_eng(queda_esp, " C", 1)],
+                ["Retorno inicial -> final", f"{_fmt_eng(ret_ini, ' C', 1)} -> {_fmt_eng(ret_fim, ' C', 1)}"],
+                ["Queda do retorno", _fmt_eng(queda_ret, " C", 1)],
+                ["DT medio", _fmt_eng(dt_med, " C", 2)],
+                ["Taxa do espeto", _fmt_eng(taxa_esp, " C/h", 2)],
+                ["Umidade", f"{_fmt_eng(umid, ' %', 1)} - {ur_text}"],
+                ["Ventilacao", _fmt_eng(vent, " %", 1)],
+                ["Sintese", f"{pace_text}; avaliar DT e ventilacao contra a preservacao de umidade."],
+            ],
+            col_widths=[4.5 * cm, 11.9 * cm],
+        ))
+        elements.append(Spacer(1, 0.28 * cm))
+
+    if summary.tempo_ate_7h is not None:
+        if summary.tempo_ate_7h <= max_cycle_hours:
+            closing = (
+                f"A narrativa fecha com a meta principal atendida: o espeto chegou a 7 C em "
+                f"{_fmt_eng(summary.tempo_ate_7h, ' h')}, contado a partir do inicio do resfriamento."
+            )
+        else:
+            closing = (
+                f"A narrativa fecha com atraso na meta principal: o espeto chegou a 7 C em "
+                f"{_fmt_eng(summary.tempo_ate_7h, ' h')}, acima das {max_cycle_hours:.0f} h de referencia."
+            )
+    else:
+        closing = "A narrativa fecha sem registro de chegada do espeto a 7 C dentro do ciclo analisado."
+
+    elements.append(Paragraph(closing, styles["description"]))
+    return elements
+
+
+def generate_pdf_for_cycle(
+    output_path: Path,
+    cycle_df: pd.DataFrame,
+    summary: CycleSummary,
+    tolerance_band: float,
+    rate_window_minutes: int,
+) -> None:
+    """
+    Gera PDF com capa, tabelas e 6 graficos do ciclo.
+    """
+    overall_df = build_overall_metrics_table(cycle_df, tolerance_band, rate_window_minutes)
+    phase_df = build_phase_summary_table(cycle_df, tolerance_band, rate_window_minutes)
+
+    styles = build_styles()
+
+    doc = SimpleDocTemplate(
+        str(output_path),
+        pagesize=A4,
+        leftMargin=1.35 * cm,
+        rightMargin=1.35 * cm,
+        topMargin=1.25 * cm,
+        bottomMargin=1.25 * cm,
+        title=f"Relatorio Ciclo {summary.cycle_id}",
+        author="Camara de Resfriados - Analise de Ciclos",
+    )
+
+    story = []
+
+    # ===== CAPA =====
+    banner_data = [[Paragraph(f"Relat&oacute;rio do Ciclo {summary.cycle_id}", styles["cover_title"])]]
+    content_width = 18.3 * cm
+    banner = Table(banner_data, colWidths=[content_width])
+    banner.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#1F4E78")),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 14),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 14),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+    ]))
+    story.append(Spacer(1, 0.35 * cm))
+    story.append(build_cover_brand_table())
+    story.append(Spacer(1, 0.35 * cm))
+    story.append(banner)
+    story.append(Spacer(1, 0.22 * cm))
+    story.append(Paragraph(
+        "C&acirc;mara de Resfriados &mdash; Frigor&iacute;fico Thoms",
+        styles["cover_subtitle"],
+    ))
+    if summary.inicio_ciclo:
+        story.append(Paragraph(
+            summary.inicio_ciclo.strftime("In&iacute;cio: %d/%m/%Y %H:%M"),
+            styles["cover_date"],
+        ))
+    story.append(Spacer(1, 0.28 * cm))
+
+    # Strip de 6 KPIs
+    overall_row = overall_df.iloc[0] if not overall_df.empty else None
+    folga_cover = _value_by_tokens(overall_row, "folga", "16") if overall_row is not None else None
+    queda_espeto_cover = _value_by_tokens(overall_row, "queda", "espeto") if overall_row is not None else None
+    queda_retorno_cover = _value_by_tokens(overall_row, "queda", "retorno") if overall_row is not None else None
+    kpis = [
+        ("Tempo até 7 °C", format_hours(summary.tempo_ate_7h)),
+        ("Folga até 16 h", format_hours(folga_cover)),
+        ("Queda espeto", format_temp(queda_espeto_cover)),
+        ("Queda retorno ate 7 C", format_temp(queda_retorno_cover)),
+        ("Espeto final", format_temp(summary.espeto_final)),
+        ("Resfriamento", format_hours(summary.duracao_resfriamento_h)),
+    ]
+    story.append(build_kpi_summary_table(kpis, styles))
+    story.append(Spacer(1, 0.22 * cm))
+
+    # Tabela de timestamps
+    story.append(Paragraph("Informa&ccedil;&otilde;es do ciclo", styles["section"]))
+    info_rows = [
+        ["Ciclo", f"C{summary.cycle_id}"],
+        ["In&iacute;cio do ciclo", format_pdf_value(summary.inicio_ciclo)],
+        ["Fim do ciclo", format_pdf_value(summary.fim_ciclo)],
+        ["In&iacute;cio do carregamento", format_pdf_value(summary.inicio_carregamento)],
+        ["Fim do carregamento", format_pdf_value(summary.fim_carregamento)],
+        ["In&iacute;cio do resfriamento", format_pdf_value(summary.inicio_resfriamento)],
+    ]
+    info_rows = [
+        [Paragraph(r[0], styles["normal"]), Paragraph(r[1], styles["normal"])]
+        for r in info_rows
+    ]
+    story.append(kv_table(info_rows))
+    story.append(Spacer(1, 0.12 * cm))
+    story.append(Paragraph(
+        f"Par&acirc;metros: tolerancia do glicol = &plusmn;{tolerance_band:.1f} &deg;C &nbsp;|&nbsp; "
+        f"janela da taxa de resfriamento = {rate_window_minutes} min.",
+        styles["caption"],
+    ))
+
+    story.append(PageBreak())
+
+    # ===== ANÁLISE DESCRITIVA (logo após capa) =====
+    story.extend(build_engineering_analysis(
+        summary=summary,
+        overall_df=overall_df,
+        phase_df=phase_df,
+        tolerance_band=tolerance_band,
+        rate_window_minutes=rate_window_minutes,
+        styles=styles,
+    ))
+
+    story.append(PageBreak())
+
+    story.extend(build_conclusion_page(
+        summary=summary,
+        overall_df=overall_df,
+        phase_df=phase_df,
+        tolerance_band=tolerance_band,
+        rate_window_minutes=rate_window_minutes,
+        styles=styles,
+    ))
+
+    story.append(PageBreak())
+
+    # ===== INDICADORES GERAIS =====
+    story.append(Paragraph("Indicadores gerais do ciclo", styles["section"]))
+    if not overall_df.empty:
+        rows = [
+            [
+                Paragraph(str(col), styles["normal"]),
+                Paragraph(format_pdf_value(overall_df[col].iloc[0]), styles["normal"]),
+            ]
+            for col in overall_df.columns
+        ]
+        story.append(kv_table(rows, col_widths=(10.5 * cm, 6 * cm)))
+    else:
+        story.append(Paragraph("Sem dados para o ciclo.", styles["normal"]))
+
+    story.append(Spacer(1, 0.18 * cm))
+
+    # ===== RESUMO POR FASE =====
+    story.append(Paragraph("Indicadores por fase", styles["section"]))
+    if not phase_df.empty:
+        src_cols = [
+            "Fase",
+            "Duração (h)",
+            "Temp espeto média (°C)",
+            "Temp retorno média (°C)",
+            "DT médio (°C)",
+            "Umidade média (%)",
+            "Ventilação média (%)",
+            "Erro abs médio glicol (°C)",
+        ]
+        compact_cols = [
+            "Fase", "Dur.(h)", "Espeto\nm&eacute;d.(°C)",
+            "Retorno\nm&eacute;d.(°C)", "DT\nm&eacute;d.(°C)",
+            "Umid.\nm&eacute;d.(%)", "Vent.\nm&eacute;d.(%)",
+            "Err.gli.\nabs.(°C)",
+        ]
+        phase_local = phase_df.copy()
+        src_cols = [
+            "Fase",
+            "Duração (h)",
+            "Temp espeto inicial (°C)",
+            "Temp espeto final (°C)",
+            "Queda espeto (°C)",
+            "Temp retorno inicial (°C)",
+            "Temp retorno final (°C)",
+            "Queda retorno ar (°C)",
+            "DT médio (°C)",
+            "Umidade média (%)",
+        ]
+        compact_cols = [
+            "Fase", "Dur.(h)", "Espeto\nini.(C)",
+            "Espeto\nfim.(C)", "Queda\nesp.(C)",
+            "Retorno\nini.(C)", "Retorno\nfim.(C)",
+            "Queda\nret.(C)", "DT\nmed.(C)", "UR\nmed.(%)",
+        ]
+        phase_col_widths = [2.5*cm, 1.2*cm, 1.55*cm, 1.55*cm, 1.45*cm, 1.55*cm, 1.55*cm, 1.45*cm, 1.45*cm, 1.45*cm]
+        phase_local["Fase"] = phase_local["Fase"].map(PHASE_DISPLAY).fillna(phase_local["Fase"])
+
+        header = [Paragraph(c, styles["normal"]) for c in compact_cols]
+        rows = []
+        for _, record in phase_local.iterrows():
+            row = []
+            for c in src_cols:
+                value = record[c] if c in phase_local.columns else None
+                row.append(Paragraph(format_pdf_value(value), styles["normal"]))
+            rows.append(row)
+
+        story.append(data_table(
+            header, rows,
+            col_widths=phase_col_widths,
+        ))
+        story.append(Spacer(1, 0.08 * cm))
+        story.append(Paragraph(
+            "Tabela detalhada por fase dispon&iacute;vel na aba \"Resumo por Fase\" do arquivo Excel.",
+            styles["caption"],
+        ))
+    else:
+        story.append(Paragraph("Nenhuma fase identificada.", styles["normal"]))
+
+    story.append(PageBreak())
+
+    # ===== GRÁFICOS (2 por página) =====
+    chart_sections = [
+        (
+            "Comportamento t&eacute;rmico do ciclo",
+            lambda: plot_temperature_overview(cycle_df, summary),
+            "Primeira leitura: mostra a trajetoria do espeto, retorno de ar e glicol ao longo das fases.",
+        ),
+        (
+            "M&eacute;dias hor&aacute;rias desde o in&iacute;cio do resfriamento",
+            lambda: plot_hourly_averages(cycle_df, summary),
+            "Resume hora a hora o avanco do espeto, o DT, a umidade e a ventilacao.",
+        ),
+        (
+            "Ventiladores EC e umidade relativa",
+            lambda: plot_operational_overview(cycle_df, summary),
+            "Mostra se a limitacao de ventilacao conversa com a manutencao de umidade.",
+        ),
+        (
+            "DT do sistema (retorno ar &minus; entrada glicol)",
+            lambda: plot_dt_series(cycle_df, summary),
+            "Mostra a intensidade de troca termica usada para conduzir o resfriamento.",
+        ),
+        (
+            "Correla&ccedil;&atilde;o entre DT e umidade relativa",
+            lambda: plot_dt_humidity_correlation(cycle_df, summary),
+            "Ajuda a verificar se DTs maiores aparecem associados a queda de umidade.",
+        ),
+        (
+            "Ader&ecirc;ncia do glicol ao setpoint",
+            lambda: plot_glycol_error(cycle_df, summary, tolerance_band),
+            f"Faixa verde = toler&acirc;ncia &plusmn;{tolerance_band:.1f} &deg;C.",
+        ),
+        (
+            f"Taxa de queda &mdash; T_espeto ({rate_window_minutes} min)",
+            lambda: plot_cooling_rate(cycle_df, summary, rate_window_minutes, "espeto"),
+            "Positivo = queda de temperatura; negativo = aquecimento.",
+        ),
+        (
+            f"Taxa de queda &mdash; T_retorno_ar ({rate_window_minutes} min)",
+            lambda: plot_cooling_rate(cycle_df, summary, rate_window_minutes, "retorno_ar"),
+            "Positivo = queda de temperatura; negativo = aquecimento.",
+        ),
+    ]
+
+    # Gera imagens 2 por página
+    for i in range(0, len(chart_sections), 2):
+        pair = chart_sections[i : i + 2]
+        for title_text, plot_fn, caption_text in pair:
+            story.append(Paragraph(title_text, styles["section"]))
+            try:
+                fig = plot_fn()
+                story.append(image_from_fig(fig, width_cm=15.2))
+                plt.close(fig)
+                story.append(Paragraph(caption_text, styles["caption"]))
+            except Exception as exc:
+                story.append(Paragraph(
+                    f"N&atilde;o foi poss&iacute;vel gerar este gr&aacute;fico: {exc}",
+                    styles["normal"],
+                ))
+            story.append(Spacer(1, 0.12 * cm))
+
+        if i + 2 < len(chart_sections):
+            story.append(PageBreak())
+
+    doc.build(story)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def generate_reports(
+    data_folder: str,
+    output_dir: str = ".",
+    rate_window: int = 60,
+    tolerance: float = 0.5,
+    cycle_id: int | None = None,
+    date_start: "pd.Timestamp | None" = None,
+    date_end: "pd.Timestamp | None" = None,
+) -> int:
+    """
+    Gera relatórios em Excel e PDF sem depender de argparse.
+    Usado pelo Painel 0 do Streamlit.
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    print(f"[1/4] Lendo pasta: {data_folder}")
+    try:
+        df, file_names = load_folder_no_cache(data_folder)
+    except Exception as exc:
+        print(f"ERRO ao carregar a pasta: {exc}", file=sys.stderr)
+        raise
+    print(f"      Arquivos encontrados: {len(file_names)}")
+    print(f"      Linhas consolidadas : {len(df)}")
+
+    print("[2/4] Detectando ciclos ...")
+    df = assign_cycle_ids(df)
+    summaries = build_cycle_summaries(df)
+
+    if cycle_id is not None:
+        summaries = [s for s in summaries if s.cycle_id == cycle_id]
+        if not summaries:
+            raise ValueError(f"Ciclo {cycle_id} nao encontrado.")
+
+    # Filtro por intervalo de datas: mantém ciclos que tenham QUALQUER
+    # sobreposição com [date_start, date_end].
+    if date_start is not None or date_end is not None:
+        ds = pd.Timestamp(date_start).normalize() if date_start is not None else pd.Timestamp.min
+        de_raw = pd.Timestamp(date_end) if date_end is not None else pd.Timestamp.max
+        de = (
+            de_raw.normalize() + pd.Timedelta(days=1)
+            if de_raw != pd.Timestamp.max and de_raw == de_raw.normalize()
+            else de_raw
+        )
+        summaries = [
+            s for s in summaries
+            if (s.fim_ciclo >= ds) and (s.inicio_ciclo < de)
+        ]
+        if not summaries:
+            end_label = (de - pd.Timedelta(days=1)).date() if de != pd.Timestamp.max else "+inf"
+            raise ValueError(
+                f"Nenhum ciclo valido no intervalo "
+                f"{ds.date() if ds != pd.Timestamp.min else '-inf'} "
+                f"a {end_label}."
+            )
+
+    if not summaries:
+        raise ValueError("Nenhum ciclo valido detectado.")
+    print(f"      Ciclos validos: {len(summaries)}")
+
+    print("[3/4] Gerando relatorios ...")
+    for i, summary in enumerate(summaries, 1):
+        cycle_df = select_cycle_df(df, summary)
+        cycle_df = add_derived_columns(cycle_df, rate_window)
+
+        slug = format_cycle_filename(summary.inicio_ciclo, summary.fim_ciclo)
+        prefix = f"{summary.cycle_id:03d}"
+        xlsx_path = output_path / f"{prefix}_{slug}.xlsx"
+        pdf_path = output_path / f"{prefix}_{slug}.pdf"
+
+        print(f"      [{i}/{len(summaries)}] C{summary.cycle_id} -> Excel ({xlsx_path.name})")
+        generate_excel_for_cycle(xlsx_path, cycle_df, summary, tolerance, rate_window)
+
+        print(f"      [{i}/{len(summaries)}] C{summary.cycle_id} -> PDF   ({pdf_path.name})")
+        generate_pdf_for_cycle(pdf_path, cycle_df, summary, tolerance, rate_window)
+
+    print(f"[4/4] Concluido. {len(summaries)} ciclo(s) processado(s).")
+    print(f"      Saida: {output_path.resolve()}")
+    return len(summaries)
+
+
+# ==========================================================================
+# RELATORIO GERENCIAL COMPARATIVO
+# --------------------------------------------------------------------------
+# Consolida ate 4 ciclos lado a lado em um unico Excel. USA EXATAMENTE AS
+# MESMAS funcoes que geram os relatorios individuais (build_overall_metrics_
+# table, build_phase_summary_table, calculate_indicators), portanto os
+# numeros sao identicos aos PDFs/Excel individuais — coerencia garantida
+# por construcao (nao ha recalculo divergente).
+# ==========================================================================
+
+def generate_comparative_excel(
+    output_path: Path,
+    summaries_selected: list[CycleSummary],
+    df: pd.DataFrame,
+    tolerance_band: float,
+    rate_window_minutes: int,
+) -> Path:
+    """
+    Gera Excel comparativo consolidando ate 4 ciclos.
+    Retorna o caminho do arquivo gerado.
+    """
+    if not summaries_selected:
+        raise ValueError("Lista de ciclos vazia.")
+    if len(summaries_selected) > 4:
+        raise ValueError("Maximo de 4 ciclos por comparativo.")
+
+    # ─── Coleta dados usando a MESMA cadeia de funcoes dos relatorios individuais ───
+    per_cycle: list[dict] = []
+    for summary in summaries_selected:
+        cycle_df = (
+            df[df["cycle_id"] == summary.cycle_id]
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        cycle_df = add_derived_columns(cycle_df, rate_window_minutes)
+        overall_df = build_overall_metrics_table(cycle_df, tolerance_band, rate_window_minutes)
+        phase_df = build_phase_summary_table(cycle_df, tolerance_band, rate_window_minutes)
+        indicators = calculate_indicators(summary, overall_df, tolerance_band)
+        per_cycle.append({
+            "summary": summary,
+            "col": f"C{summary.cycle_id}",
+            "overall_df": overall_df,
+            "phase_df": phase_df,
+            "indicators": indicators,
+        })
+
+    # ─── Montagem do Workbook ───────────────────────────────────────────
+    wb = Workbook()
+
+    # ========== Aba 1: Capa e indicadores ==========
+    ws = wb.active
+    ws.title = "Capa"
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=5)
+    t = ws.cell(row=1, column=1, value="Relatorio gerencial comparativo")
+    t.font = TITLE_FONT
+    t.alignment = Alignment(horizontal="center")
+
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=5)
+    s = ws.cell(row=2, column=1, value="Camara de Resfriados - Consolidacao de ciclos")
+    s.font = SUBTITLE_FONT
+    s.alignment = Alignment(horizontal="center")
+
+    current_row = 4
+    ws.cell(row=current_row, column=1, value="Ciclos comparados:").font = SECTION_FONT
+    current_row += 1
+    for p in per_cycle:
+        summary: CycleSummary = p["summary"]
+        ws.cell(
+            row=current_row,
+            column=1,
+            value=f"  {p['col']} — inicio {summary.inicio_ciclo.strftime('%d/%m/%Y %H:%M')} | "
+                  f"duracao {summary.duracao_total_h:.2f} h"
+        )
+        current_row += 1
+    current_row += 1
+
+    # ─── Indicadores principais (faixa horizontal) ──────────────────────
+    ws.cell(row=current_row, column=1, value="Indicadores principais").font = SECTION_FONT
+    current_row += 1
+
+    header_row = current_row
+    ws.cell(row=header_row, column=1, value="Indicador").font = HEADER_FONT
+    ws.cell(row=header_row, column=1).fill = HEADER_FILL
+    ws.cell(row=header_row, column=1).border = THIN_BORDER
+    for i, p in enumerate(per_cycle):
+        c = ws.cell(row=header_row, column=2 + i, value=p["col"])
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = Alignment(horizontal="center")
+        c.border = THIN_BORDER
+    current_row += 1
+
+    def _ind_val(ind, attr, fmt="{:.2f}", suffix=""):
+        if ind is None:
+            return "—"
+        v = getattr(ind, attr, None)
+        if v is None:
+            return "—"
+        try:
+            return fmt.format(v) + suffix
+        except Exception:
+            return str(v)
+
+    main_rows = [
+        ("Tempo ate 7 °C", "tempo_7", "{:.2f}", " h"),
+        ("Folga ate 16 h", "folga_ate_16h", "{:.2f}", " h"),
+        ("Atraso acima 16 h", "atraso_acima_16h", "{:.2f}", " h"),
+        ("Espeto inicial", "esp_inicial", "{:.1f}", " °C"),
+        ("Espeto final", "esp_final", "{:.1f}", " °C"),
+        ("Queda do espeto", "queda_espeto", "{:.1f}", " °C"),
+        ("Retorno inicial", "retorno_inicial", "{:.1f}", " °C"),
+        ("Retorno final", "retorno_final", "{:.1f}", " °C"),
+        ("Queda do retorno", "queda_retorno", "{:.1f}", " °C"),
+        ("DT medio resfriamento", "dt_medio_resf", "{:.2f}", " °C"),
+        ("Umidade media", "umidade_media", "{:.1f}", " %"),
+        ("Ventilacao media", "ventilacao_media", "{:.1f}", " %"),
+        ("Erro abs glicol", "erro_abs_glicol", "{:.2f}", " °C"),
+        ("% glicol em tolerancia", "pct_glicol", "{:.1f}", " %"),
+        ("Duracao resfriamento", "dur_resf", "{:.2f}", " h"),
+    ]
+    for label, attr, fmt, suf in main_rows:
+        c_label = ws.cell(row=current_row, column=1, value=label)
+        c_label.font = Font(name=FONT_NAME, bold=True)
+        c_label.border = THIN_BORDER
+        for i, p in enumerate(per_cycle):
+            c = ws.cell(row=current_row, column=2 + i, value=_ind_val(p["indicators"], attr, fmt, suf))
+            c.alignment = Alignment(horizontal="center")
+            c.border = THIN_BORDER
+        current_row += 1
+
+    # Conformidade (linhas de booleans como ✓/✗)
+    current_row += 1
+    ws.cell(row=current_row, column=1, value="Conformidade").font = SECTION_FONT
+    current_row += 1
+
+    conformance_rows = [
+        ("Meta 7 °C ate 16 h", "meta_ok"),
+        ("Duracao ate 16 h", "atraso_ok"),
+        ("Umidade ideal (>=95%)", "umidade_ideal"),
+        ("Umidade aceitavel (>=90%)", "umidade_aceitavel"),
+        ("Glicol em tolerancia", "glicol_ok"),
+    ]
+    for label, attr in conformance_rows:
+        c_label = ws.cell(row=current_row, column=1, value=label)
+        c_label.font = Font(name=FONT_NAME, bold=True)
+        c_label.border = THIN_BORDER
+        for i, p in enumerate(per_cycle):
+            ind = p["indicators"]
+            val = "—"
+            if ind is not None:
+                v = getattr(ind, attr, None)
+                val = "OK" if v else "NAO"
+            c = ws.cell(row=current_row, column=2 + i, value=val)
+            c.alignment = Alignment(horizontal="center")
+            c.border = THIN_BORDER
+            if val == "OK":
+                c.fill = PatternFill("solid", start_color="C6EFCE")
+            elif val == "NAO":
+                c.fill = PatternFill("solid", start_color="FFC7CE")
+        current_row += 1
+
+    # Largura de colunas
+    ws.column_dimensions["A"].width = 30
+    for i in range(len(per_cycle)):
+        ws.column_dimensions[get_column_letter(2 + i)].width = 16
+
+    # ========== Aba 2+: comparacao por fase (uma aba por metrica) ==========
+    phase_metrics: list[tuple[str, str, str, str]] = [
+        # (titulo_aba, coluna_phase_df, fmt, sufixo)
+        ("Duracao por fase",          "Duração (h)",                         "{:.2f}", " h"),
+        ("Umidade por fase",          "Umidade média (%)",                   "{:.1f}", " %"),
+        ("Ventilacao por fase",       "Ventilação média (%)",                "{:.1f}", " %"),
+        ("DT por fase",               "DT médio (°C)",                       "{:.2f}", " °C"),
+        ("Queda espeto por fase",     "Queda espeto (°C)",                   "{:.2f}", " °C"),
+        ("Espeto final por fase",     "Temp espeto final (°C)",              "{:.1f}", " °C"),
+    ]
+
+    phase_order = list(PHASE_DISPLAY.keys())
+
+    for sheet_title, column_name, fmt, suffix in phase_metrics:
+        ws = wb.create_sheet(sheet_title)
+        ws.cell(row=1, column=1, value=sheet_title).font = TITLE_FONT
+
+        header_row = 3
+        ws.cell(row=header_row, column=1, value="Fase").font = HEADER_FONT
+        ws.cell(row=header_row, column=1).fill = HEADER_FILL
+        ws.cell(row=header_row, column=1).border = THIN_BORDER
+        for i, p in enumerate(per_cycle):
+            c = ws.cell(row=header_row, column=2 + i, value=p["col"])
+            c.font = HEADER_FONT
+            c.fill = HEADER_FILL
+            c.alignment = Alignment(horizontal="center")
+            c.border = THIN_BORDER
+
+        r = header_row + 1
+        for phase_key in phase_order:
+            label = PHASE_DISPLAY.get(phase_key, phase_key)
+            c_label = ws.cell(row=r, column=1, value=label)
+            c_label.font = Font(name=FONT_NAME, bold=True)
+            c_label.border = THIN_BORDER
+            for i, p in enumerate(per_cycle):
+                phase_df: pd.DataFrame = p["phase_df"]
+                cell_value = "—"
+                if not phase_df.empty and "Fase" in phase_df.columns:
+                    match = phase_df[phase_df["Fase"] == phase_key]
+                    if not match.empty and column_name in match.columns:
+                        v = match.iloc[0][column_name]
+                        if pd.notna(v):
+                            try:
+                                cell_value = fmt.format(v) + suffix
+                            except Exception:
+                                cell_value = str(v)
+                c = ws.cell(row=r, column=2 + i, value=cell_value)
+                c.alignment = Alignment(horizontal="center")
+                c.border = THIN_BORDER
+            r += 1
+
+        ws.column_dimensions["A"].width = 32
+        for i in range(len(per_cycle)):
+            ws.column_dimensions[get_column_letter(2 + i)].width = 16
+
+    # ─── Salva ──────────────────────────────────────────────────────────
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output_path)
+    return output_path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Gera relatorios em Excel e PDF para cada ciclo detectado."
+    )
+    parser.add_argument(
+        "pasta",
+        help="Pasta com os arquivos .csv/.txt da camara.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=".",
+        help="Pasta de saida dos relatorios (default: pasta atual).",
+    )
+    parser.add_argument(
+        "--rate-window",
+        type=int,
+        default=60,
+        choices=[30, 60],
+        help="Janela (min) para a taxa de queda (default: 60).",
+    )
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=0.5,
+        help="Faixa aceitavel do erro do glicol em +/- C (default: 0.5).",
+    )
+    parser.add_argument(
+        "--cycle",
+        type=int,
+        default=None,
+        help="Se informado, gera relatorio apenas deste ciclo.",
+    )
+
+    args = parser.parse_args()
+
+    generate_reports(
+        data_folder=args.pasta,
+        output_dir=args.output_dir,
+        rate_window=args.rate_window,
+        tolerance=args.tolerance,
+        cycle_id=args.cycle,
+    )
+
+
+if __name__ == "__main__":
+    main()

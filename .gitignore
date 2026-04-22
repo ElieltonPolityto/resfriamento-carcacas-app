@@ -1,0 +1,36 @@
+# Secrets: never commit real credentials.
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Local/private data and generated outputs.
+data/*.csv
+data/**/*.csv
+data/_legado_pastas_ciclos/
+reports/
+_reports*/
+_review*/
+_validacao*/
+*.pdf
+*.xlsx
+
+# Obsolete local material.
+00 - Superados/
+.claude/
+tools/
+
+# Python/runtime.
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# IDE/OS noise.
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
