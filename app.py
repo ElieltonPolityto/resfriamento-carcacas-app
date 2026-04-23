@@ -579,6 +579,110 @@ def build_cycle_label(summary: CycleSummary) -> str:
     )
 
 
+def _date_span(start: datetime.date, end: datetime.date) -> list[datetime.date]:
+    """Lista datas calendario em intervalo inclusivo."""
+    days = []
+    cursor = start
+    while cursor <= end:
+        days.append(cursor)
+        cursor += datetime.timedelta(days=1)
+    return days
+
+
+def _missing_dates_for_cycle(cycle_df: pd.DataFrame, summary: CycleSummary) -> list[datetime.date]:
+    """Datas calendario do ciclo que nao possuem nenhuma amostra no dataframe carregado."""
+    if summary.inicio_ciclo is None or summary.fim_ciclo is None or cycle_df.empty:
+        return []
+
+    required = set(_date_span(summary.inicio_ciclo.date(), summary.fim_ciclo.date()))
+    timestamps = pd.to_datetime(cycle_df["timestamp"], errors="coerce").dropna()
+    present = set(timestamps.dt.date.unique())
+    return sorted(required - present)
+
+
+def _resolve_user_output_dir(raw_path: str) -> Path:
+    """Resolve pasta informada pelo usuario; caminhos relativos ficam dentro do projeto."""
+    cleaned = raw_path.strip()
+    if not cleaned:
+        raise ValueError("Informe uma pasta de saida.")
+
+    path = Path(cleaned).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).parent / path
+    return path
+
+
+def render_single_cycle_pdf_export(
+    cycle_df: pd.DataFrame,
+    selected_summary: CycleSummary,
+    tolerance_band: float,
+    rate_window_minutes: int,
+) -> None:
+    """Exporta somente o ciclo selecionado em PDF."""
+    st.subheader("Exportar PDF do ciclo selecionado")
+    st.caption(
+        "Gera um PDF apenas para o ciclo selecionado. "
+        "Se faltar qualquer data entre o inicio e o fim do ciclo, a exportacao fica bloqueada."
+    )
+
+    missing_dates = _missing_dates_for_cycle(cycle_df, selected_summary)
+    if missing_dates:
+        missing_label = ", ".join(day.strftime("%d/%m/%Y") for day in missing_dates)
+        st.error(
+            "Nao e possivel gerar o PDF deste ciclo porque faltam dados para: "
+            f"{missing_label}. Busque essas datas antes de exportar."
+        )
+
+    output_dir_raw = st.text_input(
+        "Pasta de saida do PDF",
+        value="reports",
+        key=f"single_pdf_output_dir_{selected_summary.cycle_id}",
+        help="Use um caminho absoluto local ou uma pasta relativa, como reports.",
+    )
+
+    disabled = bool(missing_dates) or not output_dir_raw.strip()
+    if st.button(
+        "Gerar PDF deste ciclo",
+        type="primary",
+        use_container_width=True,
+        disabled=disabled,
+        key=f"single_pdf_button_{selected_summary.cycle_id}",
+    ):
+        try:
+            from gerar_relatorio import format_cycle_filename, generate_pdf_for_cycle
+
+            output_dir = _resolve_user_output_dir(output_dir_raw)
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            report_df = add_derived_columns(cycle_df.copy(), rate_window_minutes)
+            filename = (
+                f"{selected_summary.cycle_id:03d}_"
+                f"{format_cycle_filename(selected_summary.inicio_ciclo, selected_summary.fim_ciclo)}.pdf"
+            )
+            output_path = output_dir / filename
+
+            with st.spinner(f"Gerando {filename}..."):
+                generate_pdf_for_cycle(
+                    output_path=output_path,
+                    cycle_df=report_df,
+                    summary=selected_summary,
+                    tolerance_band=tolerance_band,
+                    rate_window_minutes=rate_window_minutes,
+                )
+
+            st.success(f"PDF gerado em: `{output_path}`")
+            st.download_button(
+                label=f"Baixar {filename}",
+                data=output_path.read_bytes(),
+                file_name=filename,
+                mime="application/pdf",
+                key=f"single_pdf_download_{selected_summary.cycle_id}_{int(output_path.stat().st_mtime)}",
+                use_container_width=True,
+            )
+        except Exception as exc:
+            st.error(f"Erro ao gerar PDF: {exc}")
+
+
 # ============================================================
 # CÁLCULOS TÉRMICOS
 # ============================================================
@@ -2801,6 +2905,15 @@ def render_panel_1(
             if boundaries.primeira_vez_espeto_le_7 is not None
             else "N/A"
         )
+    )
+
+    st.divider()
+
+    render_single_cycle_pdf_export(
+        cycle_df=cycle_df,
+        selected_summary=selected_summary,
+        tolerance_band=tolerance_band,
+        rate_window_minutes=rate_window_minutes,
     )
 
     st.divider()

@@ -31,7 +31,8 @@ Na interface Streamlit, o usuario consegue:
 
 - verificar o status do banco `data/historico.csv`;
 - buscar dados novos por intervalo de datas;
-- gerar relatorios individuais em PDF e Excel;
+- gerar relatorios em PDF para um ciclo selecionado;
+- gerar relatorios em lote pelo painel de operacao, quando necessario;
 - visualizar indicadores de um ciclo especifico;
 - comparar ciclos entre si;
 - exportar um Excel comparativo gerencial.
@@ -132,8 +133,29 @@ No menu lateral, escolha **Ciclo individual**.
 
 Paineis disponiveis:
 
-- **Visao geral**: indicadores principais, resumo por fase e graficos de comportamento termico.
+- **Visao geral**: indicadores principais, exportacao de PDF do ciclo selecionado, resumo por fase e graficos de comportamento termico.
 - **Desempenho termico**: graficos tecnicos de DT, erro do glicol e taxas de queda.
+
+#### Exportar PDF de um ciclo
+
+No painel **Ciclo individual > Visao geral**, existe a secao **Exportar PDF do ciclo selecionado**.
+
+Esse fluxo foi desenhado para ser simples e seguro:
+
+- exporta apenas o ciclo que esta selecionado no seletor de ciclos;
+- nao permite exportar varios ciclos de uma vez por engano;
+- permite informar a pasta de saida do PDF;
+- aceita caminho absoluto local ou caminho relativo, como `reports`;
+- no Streamlit Cloud, alem de salvar no servidor, mostra um botao de download;
+- bloqueia a exportacao se faltar qualquer data entre o inicio e o fim do ciclo.
+
+Exemplo:
+
+- ciclo inicia em 16/04;
+- ciclo termina em 17/04;
+- para exportar o PDF, o banco precisa ter amostras de 16/04 e 17/04.
+
+Se alguma dessas datas nao existir no dataframe carregado, o botao de exportacao fica bloqueado e o app mostra quais datas precisam ser buscadas antes.
 
 ### 3. Comparar ciclos
 
@@ -412,6 +434,19 @@ Verifique a lista de dias que falharam, corrija a coleta e tente novamente.
 No Streamlit Cloud, o usuario nao navega facilmente pelo filesystem do servidor.
 
 Por isso, depois da geracao, o app mostra botoes de download para os arquivos criados.
+
+### O botao de PDF do ciclo fica bloqueado
+
+O PDF individual exige que todas as datas calendario entre o inicio e o fim do ciclo tenham dados carregados.
+
+Exemplo: se um ciclo vai de 16/04 para 17/04, mas o banco so tem 17/04, o app bloqueia a exportacao para evitar um PDF incompleto.
+
+Resolucao:
+
+1. Va em **Operacao > Coletar dados**.
+2. Busque a data faltante indicada na mensagem.
+3. Volte para **Ciclo individual > Visao geral**.
+4. Gere o PDF novamente.
 
 ### O ciclo esperado nao aparece ao filtrar uma data
 
