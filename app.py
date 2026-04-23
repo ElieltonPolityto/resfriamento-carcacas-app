@@ -15,6 +15,10 @@ import pandas as pd
 import streamlit as st
 
 
+class DataValidationError(ValueError):
+    """Erro de integridade ou estrutura dos dados de entrada."""
+
+
 # ============================================================
 # CONFIGURAÇÃO GERAL DA APLICAÇÃO
 # ============================================================
@@ -288,6 +292,26 @@ def detect_delimiter(header_line: str) -> str:
     raise ValueError("Delimitador não identificado. Esperado tabulação ou ';'.")
 
 
+def format_missing_required_columns_error(
+    file_name: str,
+    missing_columns: set[str],
+    available_columns: list[str],
+) -> str:
+    """
+    Monta uma mensagem clara para arquivos sem as colunas minimas esperadas.
+    """
+    missing_label = ", ".join(sorted(missing_columns))
+    available_label = ", ".join(available_columns) if available_columns else "nenhuma"
+    return (
+        f"O arquivo {file_name} nao pode ser usado porque faltam colunas obrigatorias: "
+        f"{missing_label}. "
+        "Sem essas colunas nao e possivel identificar corretamente os ciclos nem calcular "
+        "os indicadores do relatorio. "
+        "Atualize o banco em 'Coletar dados' ou exporte o CSV novamente incluindo essas "
+        f"variaveis. Colunas encontradas: {available_label}."
+    )
+
+
 def load_single_file(file_path: Path) -> pd.DataFrame:
     """
     Lê um único arquivo e retorna DataFrame limpo e padronizado.
@@ -317,10 +341,12 @@ def load_single_file(file_path: Path) -> pd.DataFrame:
 
     missing = REQUIRED_COLUMNS - set(df.columns)
     if missing:
-        raise ValueError(
-            f"Arquivo {file_path.name} sem colunas mínimas. "
-            f"Faltando: {sorted(missing)}. "
-            f"Colunas encontradas: {list(df.columns)}"
+        raise DataValidationError(
+            format_missing_required_columns_error(
+                file_name=file_path.name,
+                missing_columns=missing,
+                available_columns=list(df.columns),
+            )
         )
 
     df["timestamp"] = parse_timestamp_series(df["timestamp"])
@@ -2516,6 +2542,34 @@ def _run_generation(
                     key=f"download_{file_path.name}_{int(file_path.stat().st_mtime)}",
                     use_container_width=True,
                 )
+    except DataValidationError as exc:
+        st.error(
+            "Nao foi possivel gerar os relatorios porque o banco de dados esta incompleto "
+            "ou fora do padrao esperado."
+        )
+        st.write(str(exc))
+        st.markdown(
+            "O que fazer:\n"
+            "1. Va em **Coletar dados** e atualize o banco.\n"
+            "2. Se voce usa um CSV manual, exporte novamente com todas as variaveis obrigatorias.\n"
+            "3. Tente gerar os relatorios outra vez."
+        )
+    except KeyError as exc:
+        missing_column = str(exc).strip("'\"")
+        st.error(
+            f"Nao foi possivel gerar os relatorios porque a coluna obrigatoria "
+            f"'{missing_column}' nao foi encontrada no banco de dados."
+        )
+        st.write(
+            "Sem essa coluna o sistema nao consegue separar corretamente as fases do ciclo "
+            "nem calcular os indicadores termicos."
+        )
+        st.markdown(
+            "O que fazer:\n"
+            "1. Va em **Coletar dados** e atualize o banco.\n"
+            "2. Se o erro continuar, reexporte o CSV do supervisorio incluindo essa variavel.\n"
+            "3. Gere os relatorios novamente."
+        )
     except ValueError as ve:
         st.warning(f"⚠️ {ve}")
     except Exception as e:

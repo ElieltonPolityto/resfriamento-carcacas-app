@@ -83,7 +83,6 @@ from app import (  # noqa: E402
     format_temp,
     generate_cycle_description,
     load_single_file,
-    parse_timestamp_series,
     plot_cooling_rate,
     plot_dt_series,
     plot_glycol_error,
@@ -104,63 +103,9 @@ def load_consolidated_csv(file_path: Path) -> pd.DataFrame:
     Le um CSV consolidado gerado por gerar_relatorio_camcarcacas.py
     (com 5 linhas de cabeçalho, linha 6 é o header, dados a partir da linha 7).
     """
-    # Lê o CSV pulando as 5 primeiras linhas, usando linha 6 como cabeçalho
-    df = pd.read_csv(
-        file_path,
-        sep=";",
-        skiprows=5,
-        decimal=",",
-    )
-
-    # A primeira coluna contém o timestamp (tem nome " " ou vazio)
-    # Renomeia primeiro antes de remover colunas vazias
-    first_col = df.columns[0]
-    df = df.rename(columns={first_col: "timestamp"})
-
-    # Limpa os nomes das demais colunas (remove espaços extras)
-    df.columns = [c.strip() if c != "timestamp" else c for c in df.columns]
-
-    # Remove colunas completamente vazias (NaN) - preservando as com dados
-    df = df.dropna(axis=1, how="all")
-
-    # Remove colunas que são apenas strings vazias ou espaços (exceto timestamp)
-    cols_to_keep = ["timestamp"]
-    for col in df.columns:
-        if col == "timestamp":
-            continue
-        if col == "" or col.isspace():
-            continue
-        cols_to_keep.append(col)
-    df = df[cols_to_keep]
-
-    # Mapeamento das colunas para o formato esperado
-    column_mapping = {
-        "Carregamento": "carregamento",
-        "Resfriamento": "resfriamento",
-        "Saida Y1 - Ventiladores EC": "ventiladores_ec",
-        "Temp entrada glicol": "temp_entrada_glicol",
-        "Temp ref": "temp_ref",
-        "Temp retorno ar": "temp_retorno_ar",
-        "Temperatuda espeto": "temperatura_espeto",  # Typo no CSV original
-        "Temperatura espeto": "temperatura_espeto",
-        "Umidade relativa da camara": "umidade_relativa_camara",
-    }
-
-    # Renomeia as colunas encontradas
-    df = df.rename(columns=column_mapping, errors="ignore")
-
-    # Converte timestamp para datetime
-    # dayfirst=True: garante que DD/MM/YYYY seja interpretado corretamente (padrão BR)
-    df["timestamp"] = parse_timestamp_series(df["timestamp"])
-    # Remove linhas com timestamp inválido
-    df = df.dropna(subset=["timestamp"])
-
-    # Remove colunas desnecessárias
-    cols_to_drop = ["Ciclo"] + [col for col in df.columns if col.startswith("Unnamed")]
-    df = df.drop(columns=cols_to_drop, errors="ignore")
-
-    # Garante a ordem das colunas esperadas
-    required_cols = [
+    # Usa o mesmo parser do app para garantir a mesma validacao de colunas.
+    df = load_single_file(file_path)
+    ordered_cols = [
         "timestamp",
         "carregamento",
         "resfriamento",
@@ -170,33 +115,10 @@ def load_consolidated_csv(file_path: Path) -> pd.DataFrame:
         "temp_retorno_ar",
         "temperatura_espeto",
         "umidade_relativa_camara",
+        "arquivo_origem",
     ]
-
-    # Seleciona apenas as colunas que existem
-    existing_cols = [col for col in required_cols if col in df.columns]
-    df = df[existing_cols]
-
-    # Converte colunas numéricas (decimal com vírgula)
-    numeric_cols = [
-        "ventiladores_ec",
-        "temp_entrada_glicol",
-        "temp_ref",
-        "temp_retorno_ar",
-        "temperatura_espeto",
-        "umidade_relativa_camara",
-    ]
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.replace(",", ".", regex=False)
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Converte colunas ON/OFF para booleano
-    from app import parse_on_off
-    for col in ["carregamento", "resfriamento"]:
-        if col in df.columns:
-            df[col] = df[col].apply(parse_on_off)
-
-    return df
+    existing_cols = [col for col in ordered_cols if col in df.columns]
+    return df[existing_cols]
 
 
 def load_folder_no_cache(folder_path: str) -> tuple[pd.DataFrame, list[str]]:

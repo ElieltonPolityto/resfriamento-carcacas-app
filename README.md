@@ -429,6 +429,18 @@ Se a coleta teve falha parcial, o app bloqueia a geracao automatica para evitar 
 
 Verifique a lista de dias que falharam, corrija a coleta e tente novamente.
 
+### Apareceu erro com `temp_retorno_ar`
+
+Esse erro indica que o banco ou o CSV carregado nao trouxe a coluna de temperatura
+de retorno de ar, que e obrigatoria para identificar as fases do ciclo e calcular
+os indicadores do relatorio.
+
+Resolucao:
+
+1. Va em **Operacao > Coletar dados** e atualize o banco.
+2. Se estiver usando CSV manual, exporte novamente incluindo a variavel `Temp retorno ar`.
+3. Gere os relatorios de novo.
+
 ### PDF/Excel nao aparecem no Streamlit Cloud
 
 No Streamlit Cloud, o usuario nao navega facilmente pelo filesystem do servidor.
