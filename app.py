@@ -216,6 +216,26 @@ def parse_on_off(value: object) -> Optional[bool]:
     return None
 
 
+def carry_forward_digital_states(
+    df: pd.DataFrame,
+    max_gap: pd.Timedelta = pd.Timedelta(hours=6),
+) -> pd.DataFrame:
+    """
+    Preenche estados digitais ausentes usando o ultimo estado conhecido.
+
+    O preenchimento reinicia apos gaps longos para nao atravessar trechos sem
+    amostragem suficiente.
+    """
+    if df.empty:
+        return df
+
+    df = df.sort_values("timestamp").copy()
+    segment_id = df["timestamp"].diff().gt(max_gap).cumsum()
+    for col in ("carregamento", "resfriamento"):
+        df[col] = df.groupby(segment_id)[col].ffill()
+    return df
+
+
 def format_float(value: Optional[float], suffix: str = "", decimals: int = 2) -> str:
     """
     Formata valores numéricos de forma segura para exibição.
@@ -366,6 +386,7 @@ def load_single_file(file_path: Path) -> pd.DataFrame:
     df["resfriamento"] = df["resfriamento"].apply(parse_on_off)
 
     df = df.dropna(subset=["timestamp"]).copy()
+    df = carry_forward_digital_states(df)
     df["arquivo_origem"] = file_path.name
 
     return df
