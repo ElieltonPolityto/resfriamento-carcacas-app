@@ -163,6 +163,9 @@ def _generate_report_once(driver, date_str: str) -> str:
     time.sleep(1)
 
     driver.execute_script(f"""
+        if (document.getElementById('r_path')) {{
+            document.getElementById('r_path').value = '';
+        }}
         document.getElementById('date_from').value = '{date_str}';
         document.getElementById('date_to').value   = '{date_str}';
         document.getElementById('command').value   = 'printReport';
@@ -293,6 +296,57 @@ def _extract_data_rows(csv_text: str) -> list[str]:
         # Remove '\r' residual e normaliza
         rows.append(line.rstrip("\r"))
     return rows
+
+
+def _extract_csv_bounds(csv_text: str) -> tuple[datetime.datetime | None, datetime.datetime | None]:
+    """
+    Retorna o primeiro e o último timestamp válidos presentes no CSV baixado.
+    """
+    rows = _extract_data_rows(csv_text)
+    timestamps: list[datetime.datetime] = []
+    for row in rows:
+        ts = _row_timestamp_key(row)
+        if not ts:
+            continue
+        try:
+            timestamps.append(datetime.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            continue
+
+    if not timestamps:
+        return None, None
+
+    timestamps.sort()
+    return timestamps[0], timestamps[-1]
+
+
+def _validate_daily_csv(csv_text: str, requested_date: datetime.date) -> None:
+    """
+    Valida se o CSV baixado parece coerente para a data solicitada.
+
+    Para dias já encerrados, rejeita arquivos que terminem cedo demais, pois isso
+    costuma indicar que o supervisório devolveu um relatório antigo/em cache.
+    """
+    first_ts, last_ts = _extract_csv_bounds(csv_text)
+    if first_ts is None or last_ts is None:
+        raise ValueError("CSV baixado sem timestamps válidos.")
+
+    if first_ts.date() != requested_date or last_ts.date() != requested_date:
+        raise ValueError(
+            f"CSV de {requested_date:%d/%m/%Y} com intervalo inesperado: "
+            f"{first_ts:%d/%m/%Y %H:%M} -> {last_ts:%d/%m/%Y %H:%M}."
+        )
+
+    today = datetime.date.today()
+    if requested_date < today:
+        expected_last = datetime.datetime.combine(requested_date, datetime.time(23, 50))
+        if last_ts < expected_last:
+            raise ValueError(
+                f"CSV de {requested_date:%d/%m/%Y} parece incompleto: último registro em "
+                f"{last_ts:%H:%M}. Como esse dia já terminou, o esperado seria um arquivo "
+                "próximo de 23:59. Isso normalmente indica que o supervisório devolveu um "
+                "relatório antigo ou em cache."
+            )
 
 
 def _build_master_header(min_ts: str, max_ts: str) -> list[str]:
@@ -487,27 +541,46 @@ def fetch_dates(dates: list[datetime.date]) -> dict:
         raise ValueError("Lista de datas vazia.")
 
     dates = sorted(set(dates))
-    date_strs = [d.strftime("%d/%m/%Y") for d in dates]
-
     driver = create_session()
     csv_texts = []
     falhas = []
 
     try:
-        for date_str in date_strs:
+        for requested_date in dates:
+            date_str = requested_date.strftime("%d/%m/%Y")
             print(f"\n{'='*50}")
             print(f"Processando: {date_str}")
-            try:
-                server_path = generate_report(driver, date_str)
-                csv_text    = download_csv(driver, server_path)
-                if not _extract_data_rows(csv_text):
-                    raise ValueError("CSV baixado sem linhas de dados válidas.")
-                csv_texts.append(csv_text)
-            except Exception as e:
-                print(f"  [FALHA] {date_str}: {e}")
-                falhas.append(f"{date_str}: {e}")
+            last_error: Exception | None = None
+
+            for attempt in range(1, 4):
+                try:
+                    if attempt > 1:
+                        print("  Reabrindo sessão para evitar relatório antigo/em cache...")
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                        driver = create_session()
+
+                    server_path = generate_report(driver, date_str)
+                    csv_text = download_csv(driver, server_path)
+                    if not _extract_data_rows(csv_text):
+                        raise ValueError("CSV baixado sem linhas de dados válidas.")
+                    _validate_daily_csv(csv_text, requested_date)
+                    csv_texts.append(csv_text)
+                    break
+                except Exception as e:
+                    last_error = e
+                    print(f"  [FALHA tentativa {attempt}/3] {date_str}: {e}")
+                    if attempt < 3:
+                        time.sleep(3)
+            else:
+                falhas.append(f"{date_str}: {last_error}")
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
     print(f"\n{'='*50}")
     print(f"Mesclando dados em {MASTER_CSV.name}...")

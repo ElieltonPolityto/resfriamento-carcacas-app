@@ -429,6 +429,15 @@ Se a coleta teve falha parcial, o app bloqueia a geracao automatica para evitar 
 
 Verifique a lista de dias que falharam, corrija a coleta e tente novamente.
 
+### O CSV de um dia passado veio truncado
+
+Se um dia ja encerrado vier, por exemplo, so ate 16:35 em vez de ir ate perto de 23:59,
+isso normalmente indica que o supervisório devolveu um relatorio antigo ou em cache
+para aquela data.
+
+O coletor agora trata esse caso como falha de coleta para evitar que um CSV parcial
+seja mesclado silenciosamente no banco.
+
 ### Apareceu erro com `temp_retorno_ar`
 
 Esse erro indica que o banco ou o CSV carregado nao trouxe a coluna de temperatura
