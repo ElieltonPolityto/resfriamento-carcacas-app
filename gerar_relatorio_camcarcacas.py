@@ -14,6 +14,7 @@ import datetime
 import re
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 # Selenium/requests são importados apenas nas funções de coleta, para permitir
@@ -57,8 +58,10 @@ BASE_URL   = f"http://{CAREL_HOST}:{CAREL_PORT}/boss"
 DATA_DIR = Path(__file__).parent / "data"
 MASTER_CSV = DATA_DIR / "historico.csv"
 LEGACY_DIR = DATA_DIR / "_legado_pastas_ciclos"
+SELENIUM_PROFILE_DIR = DATA_DIR / "_selenium_profiles"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+SELENIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _check_credentials():
@@ -114,10 +117,13 @@ def create_session(max_attempts: int = 3, backoff_seconds: float = 3.0):
 
     def _opts_factory():
         opts = Options()
+        profile_dir = Path(tempfile.mkdtemp(prefix="chrome_", dir=SELENIUM_PROFILE_DIR))
         opts.add_argument("--headless=new")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--disable-gpu")
+        opts.add_argument(f"--user-data-dir={profile_dir}")
+        opts.add_argument(f"--disk-cache-dir={profile_dir / 'cache'}")
         chrome_bin = os.getenv("CHROME_BIN")
         if not chrome_bin and Path("/usr/bin/chromium").exists():
             chrome_bin = "/usr/bin/chromium"
@@ -280,7 +286,7 @@ _COL_NAMES = (
 def _extract_data_rows(csv_text: str) -> list[str]:
     """
     Extrai somente as linhas de dados válidas (pulando 6 linhas de cabeçalho).
-    Descarta linhas com dados vazios ('---' no campo Carregamento).
+    Descarta apenas linhas sem nenhum sensor útil.
     """
     lines = csv_text.replace("\r", "").split("\n")
     rows = []
@@ -290,10 +296,13 @@ def _extract_data_rows(csv_text: str) -> list[str]:
         parts = line.split(";")
         if len(parts) < 2:
             continue
-        # Descarta linhas com '---' (supervisório sem dados no minuto)
-        if "---" in parts[1]:
+        useful_values = [
+            value.strip().strip('"')
+            for value in parts[1:]
+            if value.strip().strip('"') not in {"", "---"}
+        ]
+        if not useful_values:
             continue
-        # Remove '\r' residual e normaliza
         rows.append(line.rstrip("\r"))
     return rows
 
