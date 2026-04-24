@@ -5,7 +5,8 @@ os registros em um único banco de dados (data/historico.csv).
 Modelo: banco único acumulativo.
 - Cada execução baixa ontem + hoje e mescla em `data/historico.csv`
 - Deduplicação por timestamp (mantém o valor mais recente)
-- Linhas com dados vazios ("---") são descartadas
+- Linhas sem nenhum dado util sao descartadas; linhas com sensores validos e
+  estados digitais "---" sao mantidas
 - Pastas legadas "Ciclo N" podem ser migradas via `migrate_legacy_folders()`
 """
 

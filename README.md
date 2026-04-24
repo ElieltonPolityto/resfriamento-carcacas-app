@@ -127,6 +127,8 @@ Se faltarem dias no banco para o intervalo solicitado, o app informa e pergunta 
 
 Se a coleta terminar com falhas parciais, os relatorios nao sao gerados automaticamente. Isso evita que o usuario receba um relatorio aparentemente valido com dados incompletos.
 
+Se um ciclo ainda estiver em resfriamento no momento da geracao, isso nao deve bloquear o relatorio. O app gera o relatorio com os dados disponiveis ate o ultimo timestamp carregado; nesse caso, o ciclo deve ser interpretado como parcial/em andamento.
+
 ### 2. Ciclo individual
 
 No menu lateral, escolha **Ciclo individual**.
@@ -200,7 +202,18 @@ Regras importantes:
 - um novo ciclo comeca quando o carregamento passa de `OFF` para `ON`;
 - o ciclo e separado quando ha lacunas grandes de amostragem;
 - o ciclo considera as fases de carregamento, resfriamento e pos-meta;
+- ciclos ainda em andamento podem ser analisados com os dados disponiveis ate o momento da geracao;
+- valores `---` em `Carregamento` e `Resfriamento` sao tratados como estado ausente, nao como fim automatico de fase;
+- estados digitais ausentes sao preenchidos com o ultimo estado conhecido dentro de segmentos continuos de dados;
 - para a leitura do espeto no final do ciclo, o app evita contaminar o relatorio com uma nova carga quente quando o operador esquece de apertar o botao de carregamento.
+
+### Estados digitais com `---`
+
+Quando o supervisorio exporta `---` nas colunas `Carregamento` ou `Resfriamento`, o app nao descarta automaticamente a linha se ela ainda tiver leituras uteis de sensores.
+
+Na leitura do banco, `---` vira estado ausente. Depois, o app carrega para frente o ultimo estado digital conhecido dentro do mesmo trecho continuo de dados. Esse comportamento influencia o calculo de tempo de carregamento/resfriamento de forma intencional: ele evita encurtar artificialmente uma fase so porque o supervisorio deixou o estado digital em branco em algumas amostras.
+
+Por seguranca, esse preenchimento nao atravessa lacunas maiores que 6 horas. Depois de uma lacuna longa, o app exige um novo estado conhecido para continuar inferindo a fase.
 
 ### Regra do espeto acima de 30 °C
 
@@ -239,6 +252,8 @@ Estes arquivos e pastas nao devem ir para o GitHub:
 data/
 reports/
 _reports_layout_final/
+data/_debug_supervisorio*/
+data/_selenium_profiles/
 *.csv
 *.pdf
 *.xlsx
@@ -438,17 +453,23 @@ para aquela data.
 O coletor agora trata esse caso como falha de coleta para evitar que um CSV parcial
 seja mesclado silenciosamente no banco.
 
-### Apareceu erro com `temp_retorno_ar`
+### Mensagem sobre coluna `temp_retorno_ar`
 
-Esse erro indica que o banco ou o CSV carregado nao trouxe a coluna de temperatura
-de retorno de ar, que e obrigatoria para identificar as fases do ciclo e calcular
-os indicadores do relatorio.
+O app nao deve mais mostrar apenas o erro cru `Erro ao gerar relatorios: 'temp_retorno_ar'`.
+
+Se aparecer uma mensagem citando `temp_retorno_ar`, isso indica que o banco ou o CSV carregado nao trouxe a coluna de temperatura de retorno de ar. Essa coluna ainda e obrigatoria para identificar as fases do ciclo e calcular os indicadores do relatorio.
 
 Resolucao:
 
 1. Va em **Operacao > Coletar dados** e atualize o banco.
 2. Se estiver usando CSV manual, exporte novamente incluindo a variavel `Temp retorno ar`.
 3. Gere os relatorios de novo.
+
+### Colunas `Carregamento` ou `Resfriamento` vieram com `---`
+
+Isso nao deve impedir a geracao do relatorio se as demais leituras de sensores estiverem presentes.
+
+O app mantem essas linhas, interpreta o `---` como estado ausente e usa o ultimo estado digital conhecido dentro do mesmo trecho continuo de dados. Se houver uma lacuna maior que 6 horas, o preenchimento e reiniciado para nao inventar fase atravessando um periodo sem amostragem confiavel.
 
 ### PDF/Excel nao aparecem no Streamlit Cloud
 
