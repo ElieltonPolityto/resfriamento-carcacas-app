@@ -8,6 +8,7 @@
 data/*.csv
 data/**/*.csv
 data/_legado_pastas_ciclos/
+data/_debug_supervisorio*/
 data/_selenium_profiles/
 reports/
 _reports*/
