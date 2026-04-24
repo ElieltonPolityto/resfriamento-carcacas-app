@@ -1,13 +1,13 @@
 """
-Coleta CSV do CamCarcacas (Carel Boss) para hoje e ontem e **acumula**
-os registros em um único banco de dados (data/historico.csv).
+Collects CamCarcacas (Carel Boss) CSV exports and accumulates them into a
+single database file (`data/historico.csv`).
 
-Modelo: banco único acumulativo.
-- Cada execução baixa ontem + hoje e mescla em `data/historico.csv`
-- Deduplicação por timestamp (mantém o valor mais recente)
-- Linhas sem nenhum dado util sao descartadas; linhas com sensores validos e
-  estados digitais "---" sao mantidas
-- Pastas legadas "Ciclo N" podem ser migradas via `migrate_legacy_folders()`
+Data model: one cumulative database.
+- Each run downloads the requested dates and merges them into `data/historico.csv`.
+- Records are deduplicated by timestamp, keeping the latest value.
+- Rows with no useful data are discarded; rows with valid sensor readings and
+  digital states as "---" are kept.
+- Legacy "Ciclo N" folders can be migrated through `migrate_legacy_folders()`.
 """
 
 import time
@@ -269,7 +269,7 @@ def detect_cycles(data_lines: list[str]) -> list[dict]:
 
 # Cabeçalho fixo do master CSV (linhas 1-5 são ignoradas pelo parser;
 # linha 6 contém os nomes das colunas). Mantido compatível com
-# `load_consolidated_csv()` em gerar_relatorio.py.
+# `load_consolidated_csv()` in report_generation.py.
 _COL_CATEGORIES = (
     '" ";'
     + ";".join([

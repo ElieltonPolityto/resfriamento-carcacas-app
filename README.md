@@ -42,8 +42,8 @@ Na interface Streamlit, o usuario consegue:
 ```text
 .
 ├── app.py
-├── gerar_relatorio.py
-├── gerar_relatorio_camcarcacas.py
+├── report_generation.py
+├── carel_boss_collector.py
 ├── requirements.txt
 ├── packages.txt
 ├── .env.example
@@ -68,9 +68,9 @@ Responsabilidades:
 - mostrar graficos e tabelas;
 - acionar coleta e geracao de relatorios.
 
-### `gerar_relatorio.py`
+### `report_generation.py`
 
-Modulo de geracao de relatorios.
+Report generation module.
 
 Responsabilidades:
 
@@ -80,9 +80,9 @@ Responsabilidades:
 - gerar comparativos entre ciclos;
 - manter os calculos dos relatorios alinhados com os calculos da interface.
 
-### `gerar_relatorio_camcarcacas.py`
+### `carel_boss_collector.py`
 
-Modulo de coleta e consolidacao de dados vindos do supervisório.
+Carel Boss data collection and consolidation module.
 
 Responsabilidades:
 
@@ -231,8 +231,8 @@ Estes arquivos devem ir para o GitHub:
 
 ```text
 app.py
-gerar_relatorio.py
-gerar_relatorio_camcarcacas.py
+report_generation.py
+carel_boss_collector.py
 requirements.txt
 packages.txt
 .gitignore
@@ -532,7 +532,7 @@ git status --short --ignored
 Testar sintaxe Python:
 
 ```powershell
-python -m py_compile app.py gerar_relatorio.py gerar_relatorio_camcarcacas.py
+python -m py_compile app.py report_generation.py carel_boss_collector.py
 ```
 
 Rodar localmente:

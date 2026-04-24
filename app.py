@@ -696,7 +696,7 @@ def render_single_cycle_pdf_export(
         key=f"single_pdf_button_{selected_summary.cycle_id}",
     ):
         try:
-            from gerar_relatorio import format_cycle_filename, generate_pdf_for_cycle
+            from report_generation import format_cycle_filename, generate_pdf_for_cycle
 
             output_dir = _resolve_user_output_dir(output_dir_raw)
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -2468,7 +2468,7 @@ def get_master_status() -> MasterStatus:
 
     size_kb = path.stat().st_size / 1024
     try:
-        from gerar_relatorio import load_folder_no_cache
+        from report_generation import load_folder_no_cache
         df, _ = load_folder_no_cache(str(path.parent))
     except Exception:
         return MasterStatus(True, 0, 0, None, None, size_kb)
@@ -2490,7 +2490,7 @@ def get_available_dates_in_master() -> set[datetime.date]:
     if not path.exists():
         return set()
     try:
-        from gerar_relatorio import load_folder_no_cache
+        from report_generation import load_folder_no_cache
         df, _ = load_folder_no_cache(str(path.parent))
     except Exception:
         return set()
@@ -2536,7 +2536,7 @@ def _run_generation(
         with st.spinner(
             f"Gerando relatórios de {start.strftime('%d/%m/%Y')} a {end.strftime('%d/%m/%Y')}..."
         ):
-            from gerar_relatorio import generate_reports
+            from report_generation import generate_reports
             data_dir = str(Path(__file__).parent / "data")
             n_ciclos = generate_reports(
                 data_folder=data_dir,
@@ -2613,7 +2613,7 @@ def _run_fetch(start: datetime.date, end: datetime.date) -> dict | None:
         with st.spinner(
             f"Baixando {n_dias} dia(s) ({start.strftime('%d/%m/%Y')} → {end.strftime('%d/%m/%Y')})..."
         ):
-            from gerar_relatorio_camcarcacas import fetch_date_range
+            from carel_boss_collector import fetch_date_range
             return fetch_date_range(start, end)
     except Exception as e:
         st.error(f"❌ Erro ao buscar dados: {e}")
@@ -2880,7 +2880,7 @@ def render_panel_0(tolerance_band: float, rate_window_minutes: int) -> None:
             ):
                 try:
                     with st.spinner("Migrando pastas legadas..."):
-                        from gerar_relatorio_camcarcacas import migrate_legacy_folders
+                        from carel_boss_collector import migrate_legacy_folders
                         stats = migrate_legacy_folders()
                     if stats["pastas_processadas"] == 0:
                         st.info("Nenhuma pasta legada encontrada (migração já realizada).")
@@ -3589,7 +3589,7 @@ def render_panel_5(
         return
 
     # ─── Calcula indicadores de cada ciclo selecionado ──────────────────
-    from gerar_relatorio import calculate_indicators
+    from report_generation import calculate_indicators
 
     per_cycle_rows: list[dict] = []
     per_cycle_indicators: list[tuple[str, object]] = []
@@ -3777,7 +3777,7 @@ def render_panel_5(
         output_path = output_dir / filename
         try:
             with st.spinner(f"Gerando {filename}..."):
-                from gerar_relatorio import generate_comparative_excel
+                from report_generation import generate_comparative_excel
                 final_path = generate_comparative_excel(
                     output_path=output_path,
                     summaries_selected=selected_summaries,
