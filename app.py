@@ -812,6 +812,31 @@ def build_phase_boundaries(cycle_df: pd.DataFrame) -> PhaseBoundaries:
     )
 
 
+def slice_target_window(
+    valid_df: pd.DataFrame,
+    boundaries: PhaseBoundaries,
+) -> pd.DataFrame:
+    """
+    Recorta a janela do inicio do resfriamento ate a meta de espeto <= 7 C.
+
+    Quando a meta ainda nao foi atingida, retorna um DataFrame vazio com o
+    mesmo schema para permitir relatorios parciais sem quebrar o pipeline.
+    """
+    empty_like = valid_df.iloc[0:0].copy()
+    if valid_df.empty:
+        return empty_like
+    if (
+        boundaries.inicio_resfriamento is None
+        or boundaries.primeira_vez_espeto_le_7 is None
+    ):
+        return empty_like
+
+    return valid_df[
+        (valid_df["timestamp"] >= boundaries.inicio_resfriamento)
+        & (valid_df["timestamp"] <= boundaries.primeira_vez_espeto_le_7)
+    ].copy()
+
+
 def classify_phase(
     row: pd.Series,
     boundaries: Optional[PhaseBoundaries] = None,
@@ -959,15 +984,7 @@ def build_overall_metrics_table(
     if valid_df.empty:
         return pd.DataFrame()
 
-    target_window_df = pd.DataFrame()
-    if (
-        boundaries.inicio_resfriamento is not None
-        and boundaries.primeira_vez_espeto_le_7 is not None
-    ):
-        target_window_df = valid_df[
-            (valid_df["timestamp"] >= boundaries.inicio_resfriamento)
-            & (valid_df["timestamp"] <= boundaries.primeira_vez_espeto_le_7)
-        ].copy()
+    target_window_df = slice_target_window(valid_df, boundaries)
 
     espeto_valid = valid_df["temperatura_espeto"].dropna()
     retorno_valid = target_window_df["temp_retorno_ar"].dropna()
@@ -1383,15 +1400,7 @@ def build_cycle_comparison_table(
         carregamento_df = valid_df[valid_df["fase"] == "1. Carregamento"].copy()
         resfriamento_df = valid_df[valid_df["fase"].isin(PHASE_RESFRIAMENTO)].copy()
         boundaries = build_phase_boundaries(cycle_df)
-        target_window_df = pd.DataFrame()
-        if (
-            boundaries.inicio_resfriamento is not None
-            and boundaries.primeira_vez_espeto_le_7 is not None
-        ):
-            target_window_df = valid_df[
-                (valid_df["timestamp"] >= boundaries.inicio_resfriamento)
-                & (valid_df["timestamp"] <= boundaries.primeira_vez_espeto_le_7)
-            ].copy()
+        target_window_df = slice_target_window(valid_df, boundaries)
 
         rate_esp_col = f"taxa_espeto_{rate_window_minutes}m"
         rate_ret_col = f"taxa_retorno_ar_{rate_window_minutes}m"

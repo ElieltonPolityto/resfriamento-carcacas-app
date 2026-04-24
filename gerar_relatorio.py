@@ -1315,7 +1315,10 @@ def build_phase_story_page(
                 f"{_fmt_eng(summary.tempo_ate_7h, ' h')}, acima das {max_cycle_hours:.0f} h de referencia."
             )
     else:
-        closing = "A narrativa fecha sem registro de chegada do espeto a 7 C dentro do ciclo analisado."
+        closing = (
+            "A narrativa fecha sem registro de chegada do espeto a 7 C ate o ultimo "
+            "dado disponivel do ciclo analisado."
+        )
 
     elements.append(Paragraph(closing, styles["description"]))
     return elements
